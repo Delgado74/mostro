@@ -1799,6 +1799,134 @@ pub async fn show_cashu_escrow_request(
     Ok(())
 }
 
+/// Arkade analogue of [`show_hold_invoice`] (`docs/flujo-venta-ark-fiat.md`
+/// §9/§10).
+///
+/// Instead of a Lightning hold invoice, create a VHTLC escrow on the Arkade
+/// backend with the trade amount, then advance the order to `WaitingPayment`,
+/// record the buyer/seller trade pubkeys and the created preimage/hash,
+/// publish the updated order event, and cash in the take via
+/// [`db::cas_complete_pretrade_take`]. The seller receives an
+/// `Action::PayInvoice` whose "payment request" is the **VHTLC identifier**
+/// to fund; the buyer gets the usual waiting notice.
+///
+/// Unlike the Lightning path there is **no `invoice_subscribe`**: Arkade mode
+/// has no LND invoice subscription — the escrow's on-chain/vtxo state is
+/// observed instead (a later phase). The opening `Arc<RwLock<...>>` write lock
+/// covers only the backend call, so handlers are not blocked.
+#[allow(clippy::too_many_arguments)]
+pub async fn show_vhtlc_escrow_request(
+    ctx: &crate::app::context::AppContext,
+    my_keys: &Keys,
+    payment_request: Option<String>,
+    buyer_pubkey: &PublicKey,
+    seller_pubkey: &PublicKey,
+    mut order: Order,
+    request_id: Option<u64>,
+    origin: HoldInvoiceOrigin,
+) -> Result<(), MostroError> {
+    let Some(arkade_backend) = ctx.arkade_backend() else {
+        return Err(MostroInternalErr(ServiceError::HoldInvoiceError(
+            "arkade backend not configured".into(),
+        )));
+    };
+    // Seller pays only the order amount and their Mostro fee
+    // Dev fee is NOT charged to seller - it's paid by mostrod from its earnings
+    let new_amount = order.amount + order.fee;
+
+    // Create the VHTLC the seller must fund. The returned identifier is the
+    // "bolt11" equivalent a client uses to track/fund the escrow.
+    let (vhtlc_id, preimage, hash) = {
+        let mut backend = arkade_backend.write().await;
+        backend
+            .create_hold_invoice(
+                &messages::hold_invoice_description(
+                    &order.id.to_string(),
+                    &order.fiat_code,
+                    &order.fiat_amount.to_string(),
+                )
+                .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?,
+                new_amount,
+            )
+            .await
+            .map_err(|e| MostroInternalErr(ServiceError::HoldInvoiceError(e.to_string())))?
+    };
+    if let Some(invoice) = payment_request {
+        order.buyer_invoice = Some(invoice);
+    };
+
+    // Using CRUD to update all order fields (mirrors `show_hold_invoice`)
+    order.preimage = Some(bytes_to_string(&preimage));
+    order.hash = Some(bytes_to_string(&hash));
+    order.status = Status::WaitingPayment.to_string();
+    // `taken_at` anchors the waiting-state timeout clock
+    // (`find_order_by_seconds`), exactly as in `show_hold_invoice`: entering
+    // `waiting-payment` starts the seller's duty, so the clock restarts here.
+    order.set_timestamp_now();
+    order.buyer_pubkey = Some(buyer_pubkey.to_string());
+    order.seller_pubkey = Some(seller_pubkey.to_string());
+
+    // We need to publish a new event with the new status
+    let pool = ctx.pool();
+    let order_updated = update_order_event(my_keys, Status::WaitingPayment, &order)
+        .await
+        .map_err(|e| MostroInternalErr(ServiceError::NostrError(e.to_string())))?;
+    // Same compare-and-swap as the Lightning path: if the order left the
+    // pre-trade window while the VHTLC was being created, persisting this
+    // snapshot would resurrect the row and strand the VHTLC. On a miss,
+    // cancel the orphaned VHTLC and bail.
+    let won = db::cas_complete_pretrade_take(
+        pool,
+        &order_updated,
+        origin.allows_waiting_buyer_invoice(),
+    )
+    .await?;
+    if !won {
+        if let Some(backend) = ctx.arkade_backend() {
+            let mut backend = backend.write().await;
+            if let Err(e) = backend.cancel_hold_invoice(&bytes_to_string(&hash)).await {
+                tracing::warn!(
+                    "Order id {}: best-effort cancel of orphaned VHTLC failed: {e}",
+                    order.id
+                );
+            }
+        }
+        republish_winning_state_after_cas_miss(pool, my_keys, order.id).await;
+        return Err(MostroCantDo(CantDoReason::NotAllowedByStatus));
+    }
+
+    let mut new_order = order.as_new_order();
+    new_order.status = Some(Status::WaitingPayment);
+    new_order.amount = new_amount;
+    // Clear buyer_invoice to avoid leaking buyer's payout info to seller
+    new_order.buyer_invoice = None;
+
+    // We create a Message to hand the VHTLC identifier to the seller to fund
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::PayInvoice,
+        Some(Payload::PaymentRequest(Some(new_order), vhtlc_id, None)),
+        *seller_pubkey,
+        order.trade_index_seller,
+    )
+    .await;
+
+    // We notify the buyer (maker) that their order was taken and the seller
+    // must fund the VHTLC
+    enqueue_order_msg(
+        request_id,
+        Some(order.id),
+        Action::WaitingSellerToPay,
+        None,
+        *buyer_pubkey,
+        order.trade_index_buyer,
+    )
+    .await;
+
+    Ok(())
+}
+
 // Create function to reuse in case of resubscription
 pub async fn invoice_subscribe(hash: Vec<u8>, request_id: Option<u64>) -> Result<(), MostroError> {
     let mut ln_client_invoices = lightning::LndConnector::new().await?;
@@ -3705,6 +3833,176 @@ mod tests {
         let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
         assert_eq!(db.cashu_escrow_token.as_deref(), Some("cashuAtoken"));
         assert_eq!(db.cashu_escrow_locked_at, Some(1700000100));
+    }
+
+    // ───────────────────────── arkade escrow request (§9) ─────────────────────────
+
+    /// `show_vhtlc_escrow_request` creates a VHTLC on the Arkade backend,
+    /// advances the order to `WaitingPayment`, records both trade pubkeys +
+    /// the buyer's receiver address, and hands the seller an
+    /// `Action::PayInvoice` carrying the VHTLC id to fund.
+    #[tokio::test]
+    async fn show_vhtlc_escrow_request_creates_vhtlc_and_notifies_seller_to_fund() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let mut order = base_order(OrderKind::Sell, Status::Pending);
+        order.trade_index_seller = Some(2);
+        order.trade_index_buyer = Some(3);
+        // A Sell order's maker is the seller: their trade pubkey is set at
+        // creation and preserved by the take (CAS persists the taker side).
+        order.seller_pubkey = Some(seller.to_string());
+        order.creator_pubkey = seller.to_string();
+        let order = order.create(&pool).await.unwrap();
+
+        let backend = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::arkade::ArkadeBackend::new(crate::arkade::config::ArkadeConfig::default()),
+        ));
+        let ctx = crate::app::context::test_utils::TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(crate::app::context::test_utils::test_settings())
+            .with_arkade_backend(backend.clone())
+            .build();
+
+        show_vhtlc_escrow_request(
+            &ctx,
+            &keys,
+            Some("ark1buyer".to_string()),
+            &buyer,
+            &seller,
+            order.clone(),
+            Some(7),
+            HoldInvoiceOrigin::Take,
+        )
+        .await
+        .expect("arkade escrow request must succeed offline");
+
+        // Status advanced to WaitingPayment, trade pubkeys + receiver recorded.
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db.status, Status::WaitingPayment.to_string());
+        assert_eq!(db.buyer_pubkey, Some(buyer.to_string()));
+        assert_eq!(db.seller_pubkey, Some(seller.to_string()));
+        assert_eq!(db.buyer_invoice.as_deref(), Some("ark1buyer"));
+
+        // A VHTLC was created on the backend keyed by the order's stored hash,
+        // and the preimage matches the one recorded on the order.
+        let hash = db.hash.clone().expect("order hash must be recorded");
+        let b = backend.read().await;
+        let escrows = b.escrows.read().await;
+        let escrow = escrows.get(&hash).expect("escrow in backend");
+        assert_eq!(escrow.status, crate::arkade::VhtlcStatus::Pending);
+        assert_eq!(escrow.amount_sats, order.amount + order.fee);
+        assert_eq!(escrow.preimage.as_deref(), db.preimage.as_deref());
+
+        // Collect our order's queued messages (the queue is shared across tests).
+        let msgs: Vec<(Message, PublicKey)> = MESSAGE_QUEUES
+            .queue_order_msg
+            .read()
+            .await
+            .iter()
+            .filter(|(m, _)| m.get_inner_message_kind().id == Some(order.id))
+            .cloned()
+            .collect();
+
+        // The seller is asked to fund the VHTLC: PayInvoice with the VHTLC id
+        // as the payment request, buyer's invoice cleared.
+        let (seller_msg, _) = msgs
+            .iter()
+            .find(|(_, pk)| *pk == seller)
+            .expect("seller funding request");
+        assert_eq!(seller_msg.get_inner_message_kind().action, Action::PayInvoice);
+        match seller_msg.get_inner_message_kind().get_payload() {
+            Some(Payload::PaymentRequest(Some(so), pr, None)) => {
+                assert_eq!(pr, &hash);
+                assert_eq!(so.amount, order.amount + order.fee);
+                assert!(so.buyer_invoice.is_none());
+            }
+            other => panic!("expected PaymentRequest for the seller, got {other:?}"),
+        }
+
+        // The buyer gets a bare "waiting for the seller" notice.
+        let (buyer_msg, _) = msgs
+            .iter()
+            .find(|(_, pk)| *pk == buyer)
+            .expect("buyer notice");
+        assert_eq!(
+            buyer_msg.get_inner_message_kind().action,
+            Action::WaitingSellerToPay
+        );
+        assert!(buyer_msg.get_inner_message_kind().get_payload().is_none());
+    }
+
+    /// Two concurrent Arkade takes: the loser's stale `Pending` copy must be
+    /// refused by the CAS (leaving the winner's state intact) and its
+    /// orphaned VHTLC canceled back to the sender.
+    #[tokio::test]
+    async fn show_vhtlc_escrow_request_refuses_a_second_take_and_cancels_orphan_vhtlc() {
+        init_globals();
+        let pool = migrated_pool().await;
+        let keys = Keys::generate();
+        let first_buyer = Keys::generate().public_key();
+        let second_buyer = Keys::generate().public_key();
+        let seller = Keys::generate().public_key();
+        let order = base_order(OrderKind::Sell, Status::Pending)
+            .create(&pool)
+            .await
+            .unwrap();
+        let stale = order.clone();
+
+        let backend = std::sync::Arc::new(tokio::sync::RwLock::new(
+            crate::arkade::ArkadeBackend::new(crate::arkade::config::ArkadeConfig::default()),
+        ));
+        let ctx = crate::app::context::test_utils::TestContextBuilder::new()
+            .with_pool(std::sync::Arc::new(pool.clone()))
+            .with_settings(crate::app::context::test_utils::test_settings())
+            .with_arkade_backend(backend.clone())
+            .build();
+
+        show_vhtlc_escrow_request(
+            &ctx,
+            &keys,
+            None,
+            &first_buyer,
+            &seller,
+            order.clone(),
+            Some(1),
+            HoldInvoiceOrigin::Take,
+        )
+        .await
+        .expect("the first take must win");
+
+        let result = show_vhtlc_escrow_request(
+            &ctx,
+            &keys,
+            None,
+            &second_buyer,
+            &seller,
+            stale,
+            Some(2),
+            HoldInvoiceOrigin::Take,
+        )
+        .await;
+        assert!(
+            matches!(result, Err(MostroCantDo(CantDoReason::NotAllowedByStatus))),
+            "the second take must be refused, got {result:?}"
+        );
+
+        // The winner's VHTLC is untouched; the loser's orphaned VHTLC is
+        // refunded (one Pending + one Refunded escrow in the backend).
+        let db = Order::by_id(&pool, order.id).await.unwrap().unwrap();
+        assert_eq!(db.status, Status::WaitingPayment.to_string());
+        assert_eq!(db.buyer_pubkey, Some(first_buyer.to_string()));
+        let b = backend.read().await;
+        let escrows = b.escrows.read().await;
+        let winner = escrows.get(db.hash.as_ref().unwrap()).unwrap();
+        assert_eq!(winner.status, crate::arkade::VhtlcStatus::Pending);
+        assert_eq!(
+            escrows.values().filter(|e| e.status == crate::arkade::VhtlcStatus::Refunded).count(),
+            1,
+            "the orphaned VHTLC from the losing take must be refunded"
+        );
     }
 
     // ───────────────────────── nostr client plumbing ─────────────────────────

@@ -694,9 +694,12 @@ async fn dispatch_cashu(
 /// Route a validated action in Arkade mode.
 ///
 /// Mirrors [`dispatch_cashu`]'s split: escrow-independent read-only/session
-/// actions are allowed through [`handle_message_action_no_ln`]; every
-/// order-creating, bonding and escrow action is rejected with
-/// `CantDo(InvalidAction)` until the Arkade handlers land
+/// actions are allowed through [`handle_message_action_no_ln`]; order
+/// creation and the take flow branch on arkade mode inside the take handlers,
+/// which emit the VHTLC escrow request (`show_vhtlc_escrow_request`) instead
+/// of a hold invoice. Everything that advances or settles an order past
+/// `WaitingPayment` (release, cancel, dispute, add_invoice, …) is rejected
+/// with `CantDo(InvalidAction)` until the Arkade handlers land
 /// (docs/flujo-venta-ark-fiat.md).
 async fn dispatch_arkade(
     action: &Action,
@@ -710,9 +713,15 @@ async fn dispatch_arkade(
         Action::Orders | Action::LastTradeIndex | Action::RestoreSession | Action::TradePubkey => {
             handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
         }
-        // Everything else (order creation, takes, and every state that
-        // advances or settles an order) has no Arkade handler yet — reject
-        // it cleanly.
+        // Order creation + the take flow (the Arkade take handlers branch on
+        // arkade mode and emit `show_vhtlc_escrow_request`). Creatable and
+        // takeable ship together so the book never fills with untakeable
+        // orders — same reasoning as `dispatch_cashu`.
+        Action::NewOrder | Action::TakeBuy | Action::TakeSell => {
+            handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
+        }
+        // Everything that advances or settles an order past the VHTLC has no
+        // Arkade handler yet — reject it cleanly.
         _ => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
     }
 }

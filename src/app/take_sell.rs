@@ -6,7 +6,8 @@ use crate::db::{buyer_has_pending_order, update_user_trade_index};
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
     get_order, is_order_take_window_closed, set_waiting_invoice_status, show_cashu_escrow_request,
-    show_hold_invoice, update_order_event, validate_invoice, HoldInvoiceOrigin,
+    show_hold_invoice, show_vhtlc_escrow_request, update_order_event, validate_invoice,
+    HoldInvoiceOrigin,
 };
 use mostro_core::prelude::*;
 use nostr_sdk::prelude::*;
@@ -195,8 +196,13 @@ pub async fn take_sell_action(
 
     // Validate invoice and get payment request if present
     // NOW dev_fee is set correctly for proper validation
-    let payment_request =
-        validate_buyer_invoice(&msg, &order, Settings::is_cashu_enabled()).await?;
+    let payment_request = validate_buyer_invoice(
+        &msg,
+        &order,
+        Settings::is_cashu_enabled(),
+        Settings::is_arkade_enabled(),
+    )
+    .await?;
 
     let trade_index = match msg.get_inner_message_kind().trade_index {
         Some(trade_index) => trade_index,
@@ -260,6 +266,31 @@ pub async fn take_sell_action(
         return Ok(());
     }
 
+    // Arkade escrow mode: mirror the Lightning flow below, but against the
+    // Arkade VHTLC backend. The buyer's payout destination is their receiver
+    // address; if none was supplied at take time the order goes to
+    // `WaitingBuyerInvoice` (they must send it, else `job_cancel_orders_arkade`
+    // refunds/cancels after the timeout), otherwise a VHTLC is created and the
+    // seller is asked to fund it (`WaitingPayment`).
+    if Settings::is_arkade_enabled() {
+        if payment_request.is_none() {
+            update_order_status(&mut order, my_keys, pool, request_id).await?;
+        } else {
+            show_vhtlc_escrow_request(
+                ctx,
+                my_keys,
+                payment_request,
+                &event.sender,
+                &seller_pubkey,
+                order,
+                request_id,
+                HoldInvoiceOrigin::Take,
+            )
+            .await?;
+        }
+        return Ok(());
+    }
+
     // If payment request is not present, update order status to waiting buyer invoice
     if payment_request.is_none() {
         update_order_status(&mut order, my_keys, pool, request_id).await?;
@@ -288,16 +319,26 @@ pub async fn take_sell_action(
 /// instead of validated. Without this gate a stale or malformed BOLT11 payload
 /// would reject a Cashu take over a field the flow never reads.
 ///
-/// The Cashu flag is threaded in as an argument rather than read here because
-/// `Settings::is_cashu_enabled()` reads the process-wide `MOSTRO_CONFIG`
-/// `OnceLock`, which a unit test cannot toggle.
+/// Arkade escrow mode likewise skips BOLT11 validation: the buyer's payout
+/// destination is a raw receiver address, which has no invoice structure to
+/// check. Unlike the Cashu branch the supplied value is still returned (it is
+/// stored on the order), so a take without one lands the order in
+/// `WaitingBuyerInvoice`.
+///
+/// The mode flags are threaded in as arguments rather than read here because
+/// `Settings::is_cashu_enabled()` / `Settings::is_arkade_enabled()` read the
+/// process-wide `MOSTRO_CONFIG` `OnceLock`, which a unit test cannot toggle.
 async fn validate_buyer_invoice(
     msg: &Message,
     order: &Order,
     cashu_enabled: bool,
+    arkade_enabled: bool,
 ) -> Result<Option<String>, MostroError> {
     if cashu_enabled {
         return Ok(None);
+    }
+    if arkade_enabled {
+        return Ok(msg.get_inner_message_kind().get_payment_request());
     }
     validate_invoice(msg, order).await
 }
@@ -383,12 +424,21 @@ mod tests {
 
         // Act + Assert: Cashu escrow mode ignores the payload entirely.
         assert_eq!(
-            validate_buyer_invoice(&msg, &order, true).await.unwrap(),
+            validate_buyer_invoice(&msg, &order, true, false).await.unwrap(),
             None
         );
 
+        // Act + Assert: Arkade escrow mode accepts the raw payload (no BOLT11
+        // validation — it is a receiver address, not an invoice).
+        assert_eq!(
+            validate_buyer_invoice(&msg, &order, false, true)
+                .await
+                .unwrap(),
+            Some("notaninvoice".to_string())
+        );
+
         // Act + Assert: Lightning mode still refuses it.
-        let err = validate_buyer_invoice(&msg, &order, false)
+        let err = validate_buyer_invoice(&msg, &order, false, false)
             .await
             .unwrap_err();
         assert!(matches!(err, MostroCantDo(CantDoReason::InvalidInvoice)));

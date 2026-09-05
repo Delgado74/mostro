@@ -1,4 +1,5 @@
 use crate::app::bond;
+use crate::app::bond::slash::SettleLightning;
 use crate::app::context::AppContext;
 use crate::app::dev_fee::run_dev_fee_cycle;
 use crate::app::release::{do_payment, reconcile_inflight_payout};
@@ -37,7 +38,17 @@ pub async fn start_scheduler(ctx: AppContext) {
     // the spawns here keeps them from calling `LndConnector::new()` on a node
     // that has no LND. Lightning mode is unaffected (`is_cashu_enabled()` is
     // `false`, so every job below still starts exactly as before).
-    if !Settings::is_cashu_enabled() {
+    //
+    // Arkade mode is likewise excluded from the LND-backed jobs: they operate
+    // on hold invoices and LN payments that don't exist under an Arkade VHTLC
+    // escrow. The waiting-state cancel/refund tick HAS an Arkade equivalent —
+    // `job_cancel_orders_arkade`, which runs the same shared core against the
+    // Arkade backend with bonds disabled (config validation forbids the
+    // arkade + bond combination). The remaining Arkade equivalents (deadline
+    // enforcement, etc.) land with the Arkade handlers
+    // (docs/flujo-venta-ark-fiat.md).
+    let lightning_mode = !Settings::is_cashu_enabled() && !Settings::is_arkade_enabled();
+    if lightning_mode {
         job_cancel_orders(ctx.clone()).await;
         job_enforce_escrow_deadline(ctx.clone()).await;
         job_retry_failed_payments(ctx.clone()).await;
@@ -45,6 +56,10 @@ pub async fn start_scheduler(ctx: AppContext) {
         job_process_dev_fee_payment(ctx.clone()).await;
         job_process_bond_payouts(ctx.clone()).await;
         job_reconcile_stranded_maker_bonds(ctx.clone()).await;
+    } else if Settings::is_arkade_enabled() {
+        // Arkade waiting-state cancel/refund tick — mirrors
+        // `job_cancel_orders` against the VHTLC backend.
+        job_cancel_orders_arkade(ctx.clone()).await;
     }
 
     // Mode-agnostic jobs (the info event self-skips when LN status is absent).
@@ -499,6 +514,276 @@ async fn reconfirm_timeout_eligibility(
     (still_waiting && still_expired).then_some(fresh)
 }
 
+/// One waiting-state timeout pass, shared by the Lightning and Arkade
+/// `job_cancel_orders` jobs.
+///
+/// Cancels the open hold invoice / VHTLC on every order that has spent too
+/// long in `waiting-buyer-invoice` or `waiting-payment`, then either
+/// republishes it as `pending` (duty was on the taker side after a republish)
+/// or cancels it outright (duty was on the maker side).
+///
+/// `L` is the escrow backend: Lightning mode passes the `LndConnector` with
+/// `run_bonds = true`; Arkade mode passes the VHTLC backend (behind its
+/// per-tick write lock) with `run_bonds = false`.
+///
+/// `run_bonds` gates the anti-abuse-bond blocks. Arkade mode is validated at
+/// startup to be mutually exclusive with `anti_abuse_bond`, so the bond path
+/// never runs there. The generic bound still requires `SettleLightning`; the
+/// Arkade backend provides a delegating impl that the gated bond block never
+/// invokes.
+async fn cancel_waiting_orders_tick<L: EscrowBackend + SettleLightning + Send>(
+    pool: &sqlx::Pool<sqlx::Sqlite>,
+    keys: &Keys,
+    exp_seconds: u32,
+    escrow: &mut L,
+    run_bonds: bool,
+) {
+    if let Ok(older_orders_list) = crate::db::find_order_by_seconds(pool).await {
+        for order in older_orders_list.into_iter() {
+            // The tick-start snapshot may be stale by the time this
+            // iteration is reached — re-read and re-confirm before
+            // acting, so the hold-invoice/VHTLC cancel, the bond blame,
+            // and the cancel/republish below all run against the
+            // order's *current* duty rather than the snapshot's.
+            let Some(order) =
+                reconfirm_timeout_eligibility(pool, order.id, exp_seconds).await
+            else {
+                continue;
+            };
+            // Check if order is a sell order and Buyer is not sending the invoice for too much time.
+            // Same if seller is not paying hold invoice
+            if order.status == Status::WaitingBuyerInvoice.to_string()
+                || order.status == Status::WaitingPayment.to_string()
+            {
+                // If hold invoice is paid return funds to seller
+                // We return funds to seller
+                if let Some(hash) = order.hash.as_ref() {
+                    // The cancel must succeed before we clear the
+                    // order. Falling through on error would take the
+                    // order out of `find_order_by_seconds`'s
+                    // waiting-state eligibility window — and log
+                    // "funds returned" — while the hold invoice is
+                    // still encumbered, with no later tick to fix it.
+                    // Same reasoning as the bond slash/release below:
+                    // stay eligible and retry rather than persist a
+                    // state that doesn't match the HTLC.
+                    if let Err(e) = escrow.cancel_hold_invoice(hash).await {
+                        error!(
+                            "scheduler_timeout: cancel_hold_invoice failed for order {} ({e}); skipping cancel/republish so next tick retries",
+                            order.id
+                        );
+                        continue;
+                    }
+                    // A hash exists in both waiting states, but they
+                    // mean different things: in `waiting-payment` the
+                    // hold invoice was never paid (canceling voids
+                    // it), while in `waiting-buyer-invoice` the
+                    // seller already paid it and gets their funds
+                    // back.
+                    if order.status == Status::WaitingPayment.to_string() {
+                        info!("Order Id {}: Hold invoice canceled - seller did not pay it in time", &order.id);
+                    } else {
+                        info!("Order Id {}: Funds returned to seller - buyer did not send their invoice in time", &order.id);
+                    }
+                };
+                let mut order = order.clone();
+                // dev_fee should be reset unconditionally
+                order.dev_fee = 0;
+                // We re-publish the event with Pending status
+                // and update on local database
+                if order.price_from_api {
+                    order.amount = 0;
+                    order.fee = 0;
+                }
+
+                // Get order status and kind
+                let (order_status, order_kind) =
+                    match (order.get_order_status(), order.get_order_kind()) {
+                        (Ok(status), Ok(kind)) => (status, kind),
+                        _ => {
+                            tracing::warn!(
+                                "Error getting order status or kind in order {} cancel",
+                                order.id
+                            );
+                            continue;
+                        }
+                    };
+
+                // Phase 4: run the bond slash/release **before** any
+                // DB mutation that takes the order out of
+                // `find_order_by_seconds`'s
+                // `status ∈ {WaitingBuyerInvoice, WaitingPayment}`
+                // eligibility window — both `update_order_to_initial_state`
+                // (republish path) and `order_updated.update`
+                // (cancel path) below are such mutations. A
+                // transient `settle_hold_invoice` failure inside
+                // `slash_one` leaves the bond `Locked`; with the
+                // slash gated on persist success (the original
+                // Phase 4 layout) that means the slash is dropped
+                // entirely, because the order has already moved
+                // out of the eligible set and the next tick never
+                // re-picks it up. Running it here means a
+                // transient LND hiccup just defers the cancel to
+                // the next tick, at which point the slash is
+                // idempotent (HTLC's "already settled" path
+                // proceeds to a CAS no-op and returns `Ok(None)`,
+                // so neither the bond nor the user are touched
+                // twice). The notification fires immediately on
+                // first success so a later persist failure
+                // doesn't lose it — by next tick `slash_or_release_on_timeout`
+                // sees no `Locked` bond and returns `Ok(None)`,
+                // so the notice never duplicates either.
+                // `order` is the pre-mutation snapshot — its
+                // waiting status and trade pubkeys are intact,
+                // which the §3.1 buyer/seller → bond mapping needs.
+                if run_bonds {
+                    match bond::slash_or_release_on_timeout(
+                        pool,
+                        escrow,
+                        &order,
+                        Settings::get_bond(),
+                    )
+                    .await
+                    {
+                        Ok(Some(slashed)) => {
+                            bond::notify_bond_slashed(&order, &slashed).await;
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                "scheduler_timeout: bond slash/release errored for {} ({}); skipping cancel/republish so next tick retries",
+                                order.id, e
+                            );
+                            continue;
+                        }
+                    }
+                }
+
+                let (maker_action, new_status, edited_order) =
+                    match (order_status, order_kind) {
+                        (Status::WaitingBuyerInvoice, Kind::Sell)
+                        | (Status::WaitingPayment, Kind::Buy) => {
+                            // Update order status
+                            let _ = update_order_to_initial_state(
+                                pool,
+                                order.id,
+                                order.amount,
+                                order.fee,
+                                order.dev_fee,
+                            )
+                            .await;
+                            info!(
+                                "Republishing order Id {}, {}",
+                                order.id,
+                                if order_status == Status::WaitingPayment {
+                                    "taker (seller) did not pay the hold invoice in time"
+                                } else {
+                                    "taker (buyer) did not send their invoice in time"
+                                }
+                            );
+                            (
+                                Some(Action::NewOrder),
+                                Status::Pending,
+                                edit_pubkeys_order(pool, &order).await,
+                            )
+                        }
+                        (Status::WaitingBuyerInvoice, Kind::Buy)
+                        | (Status::WaitingPayment, Kind::Sell) => {
+                            // Update order status
+                            info!(
+                                "Canceled order Id {}, {}",
+                                order.id,
+                                if order_status == Status::WaitingPayment {
+                                    "maker (seller) did not pay the hold invoice in time"
+                                } else {
+                                    "maker (buyer) did not send their invoice in time"
+                                }
+                            );
+                            (
+                                Some(Action::Canceled),
+                                Status::Canceled,
+                                edit_pubkeys_order(pool, &order).await,
+                            )
+                        }
+                        _ => {
+                            tracing::info!(
+                                "Order Id {} not available for cancel",
+                                &order.id
+                            );
+                            continue;
+                        }
+                    };
+
+                // Get edited order to use for update_order_event
+                let edited_order = if let Ok(edited_order) = edited_order {
+                    println!("Edited order: {:?}", edited_order);
+                    edited_order
+                } else {
+                    tracing::warn!("Error editing pubkeys in order {} cancel", order.id);
+                    continue;
+                };
+
+                // Update order status
+                if let Ok(order_updated) =
+                    update_order_event(keys, new_status, &edited_order).await
+                {
+                    // Notify users about order status changes - here order is updated
+                    notify_users_canceled_order(&order_updated, &order, maker_action).await;
+                    // trace new status
+                    tracing::info!(
+                        "Order Id {}: Reset to status {:?}",
+                        &order_updated.id,
+                        new_status
+                    );
+                    let order_id = order_updated.id;
+                    let order_status = new_status;
+                    // Persist the new status. The bond slash/release
+                    // has already run above (before any DB mutation
+                    // that strips eligibility) — on persist failure
+                    // the next tick retries this branch only; the
+                    // slash is durable in `bonds.slashed_reason` and
+                    // a re-entry sees no `Locked` bond (or an
+                    // already-recorded slice child), so it is a
+                    // no-op (no duplicate notify).
+                    match order_updated.update(pool).await {
+                        Ok(_) => {
+                            // Phase 7: a maker-responsible timeout
+                            // cancels the order outright, terminating
+                            // its range chain — resolve the range
+                            // maker bond at close (settle + per-slice
+                            // payouts + maker refund when a slice was
+                            // slashed; plain release otherwise). The
+                            // close helper is idempotent and a cheap
+                            // no-op for non-range / already-resolved
+                            // bonds; on transient failure the
+                            // reconciliation sweep retries. The
+                            // republish branch must NOT close: the
+                            // order returns to the book with the
+                            // maker still committed. Arkade mode has
+                            // no bonds, so this is gated like the
+                            // slash above.
+                            if run_bonds && matches!(order_status, Status::Canceled) {
+                                bond::resolve_range_maker_bond_at_close_or_warn(
+                                    pool,
+                                    &order,
+                                    "scheduler_timeout",
+                                )
+                                .await;
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "scheduler_timeout: persist failed for order {} ({}); will retry next tick",
+                                order_id, e
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 async fn job_cancel_orders(ctx: AppContext) {
     info!("Create a pool to connect to db");
 
@@ -517,260 +802,59 @@ async fn job_cancel_orders(ctx: AppContext) {
         loop {
             info!("Check for order to republish for late actions of users");
 
-            if let Ok(older_orders_list) = crate::db::find_order_by_seconds(pool).await {
-                for order in older_orders_list.into_iter() {
-                    // The tick-start snapshot may be stale by the time this
-                    // iteration is reached — re-read and re-confirm before
-                    // acting, so the hold-invoice cancel, the bond blame,
-                    // and the cancel/republish below all run against the
-                    // order's *current* duty rather than the snapshot's.
-                    let Some(order) =
-                        reconfirm_timeout_eligibility(pool, order.id, exp_seconds).await
-                    else {
-                        continue;
-                    };
-                    // Check if order is a sell order and Buyer is not sending the invoice for too much time.
-                    // Same if seller is not paying hold invoice
-                    if order.status == Status::WaitingBuyerInvoice.to_string()
-                        || order.status == Status::WaitingPayment.to_string()
-                    {
-                        // If hold invoice is paid return funds to seller
-                        // We return funds to seller
-                        if let Some(hash) = order.hash.as_ref() {
-                            // The cancel must succeed before we clear the
-                            // order. Falling through on error would take the
-                            // order out of `find_order_by_seconds`'s
-                            // waiting-state eligibility window — and log
-                            // "funds returned" — while the hold invoice is
-                            // still encumbered, with no later tick to fix it.
-                            // Same reasoning as the bond slash/release below:
-                            // stay eligible and retry rather than persist a
-                            // state that doesn't match the HTLC.
-                            if let Err(e) = ln_client.cancel_hold_invoice(hash).await {
-                                error!(
-                                    "scheduler_timeout: cancel_hold_invoice failed for order {} ({e}); skipping cancel/republish so next tick retries",
-                                    order.id
-                                );
-                                continue;
-                            }
-                            // A hash exists in both waiting states, but they
-                            // mean different things: in `waiting-payment` the
-                            // hold invoice was never paid (canceling voids
-                            // it), while in `waiting-buyer-invoice` the
-                            // seller already paid it and gets their funds
-                            // back.
-                            if order.status == Status::WaitingPayment.to_string() {
-                                info!("Order Id {}: Hold invoice canceled - seller did not pay it in time", &order.id);
-                            } else {
-                                info!("Order Id {}: Funds returned to seller - buyer did not send their invoice in time", &order.id);
-                            }
-                        };
-                        let mut order = order.clone();
-                        // dev_fee should be reset unconditionally
-                        order.dev_fee = 0;
-                        // We re-publish the event with Pending status
-                        // and update on local database
-                        if order.price_from_api {
-                            order.amount = 0;
-                            order.fee = 0;
-                        }
+            cancel_waiting_orders_tick(pool, &keys, exp_seconds, &mut ln_client, true).await;
 
-                        // Get order status and kind
-                        let (order_status, order_kind) =
-                            match (order.get_order_status(), order.get_order_kind()) {
-                                (Ok(status), Ok(kind)) => (status, kind),
-                                _ => {
-                                    tracing::warn!(
-                                        "Error getting order status or kind in order {} cancel",
-                                        order.id
-                                    );
-                                    continue;
-                                }
-                            };
-
-                        // Phase 4: run the bond slash/release **before** any
-                        // DB mutation that takes the order out of
-                        // `find_order_by_seconds`'s
-                        // `status ∈ {WaitingBuyerInvoice, WaitingPayment}`
-                        // eligibility window — both `update_order_to_initial_state`
-                        // (republish path) and `order_updated.update`
-                        // (cancel path) below are such mutations. A
-                        // transient `settle_hold_invoice` failure inside
-                        // `slash_one` leaves the bond `Locked`; with the
-                        // slash gated on persist success (the original
-                        // Phase 4 layout) that means the slash is dropped
-                        // entirely, because the order has already moved
-                        // out of the eligible set and the next tick never
-                        // re-picks it up. Running it here means a
-                        // transient LND hiccup just defers the cancel to
-                        // the next tick, at which point the slash is
-                        // idempotent (HTLC's "already settled" path
-                        // proceeds to a CAS no-op and returns `Ok(None)`,
-                        // so neither the bond nor the user are touched
-                        // twice). The notification fires immediately on
-                        // first success so a later persist failure
-                        // doesn't lose it — by next tick `slash_or_release_on_timeout`
-                        // sees no `Locked` bond and returns `Ok(None)`,
-                        // so the notice never duplicates either.
-                        // `order` is the pre-mutation snapshot — its
-                        // waiting status and trade pubkeys are intact,
-                        // which the §3.1 buyer/seller → bond mapping needs.
-                        match bond::slash_or_release_on_timeout(
-                            pool,
-                            &mut ln_client,
-                            &order,
-                            Settings::get_bond(),
-                        )
-                        .await
-                        {
-                            Ok(Some(slashed)) => {
-                                bond::notify_bond_slashed(&order, &slashed).await;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                // `Err` from `slash_or_release_on_timeout` is a DB-read
-                                // failure (e.g. `find_active_bonds_for_order` /
-                                // `timeout_slash_confirmed` couldn't read the bond
-                                // rows), so we don't yet know whether the slash
-                                // applies. Falling through to cancel/republish
-                                // would persist the order out of
-                                // `find_order_by_seconds`'s waiting-state
-                                // eligibility window, and the next tick would
-                                // never re-evaluate it — losing the slash whose
-                                // applicability we couldn't even determine.
-                                // `continue` keeps the order eligible so the
-                                // next tick re-runs the full path (the slash
-                                // primitive is idempotent on a settled HTLC and
-                                // a `PendingPayout` bond, so a retry that
-                                // finds the work already done is a no-op).
-                                tracing::warn!(
-                                    "scheduler_timeout: bond slash/release errored for {} ({}); skipping cancel/republish so next tick retries",
-                                    order.id, e
-                                );
-                                continue;
-                            }
-                        }
-
-                        let (maker_action, new_status, edited_order) =
-                            match (order_status, order_kind) {
-                                (Status::WaitingBuyerInvoice, Kind::Sell)
-                                | (Status::WaitingPayment, Kind::Buy) => {
-                                    // Update order status
-                                    let _ = update_order_to_initial_state(
-                                        pool,
-                                        order.id,
-                                        order.amount,
-                                        order.fee,
-                                        order.dev_fee,
-                                    )
-                                    .await;
-                                    info!(
-                                        "Republishing order Id {}, {}",
-                                        order.id,
-                                        if order_status == Status::WaitingPayment {
-                                            "taker (seller) did not pay the hold invoice in time"
-                                        } else {
-                                            "taker (buyer) did not send their invoice in time"
-                                        }
-                                    );
-                                    (
-                                        Some(Action::NewOrder),
-                                        Status::Pending,
-                                        edit_pubkeys_order(pool, &order).await,
-                                    )
-                                }
-                                (Status::WaitingBuyerInvoice, Kind::Buy)
-                                | (Status::WaitingPayment, Kind::Sell) => {
-                                    // Update order status
-                                    info!(
-                                        "Canceled order Id {}, {}",
-                                        order.id,
-                                        if order_status == Status::WaitingPayment {
-                                            "maker (seller) did not pay the hold invoice in time"
-                                        } else {
-                                            "maker (buyer) did not send their invoice in time"
-                                        }
-                                    );
-                                    (
-                                        Some(Action::Canceled),
-                                        Status::Canceled,
-                                        edit_pubkeys_order(pool, &order).await,
-                                    )
-                                }
-                                _ => {
-                                    tracing::info!(
-                                        "Order Id {} not available for cancel",
-                                        &order.id
-                                    );
-                                    continue;
-                                }
-                            };
-
-                        // Get edited order to use for update_order_event
-                        let edited_order = if let Ok(edited_order) = edited_order {
-                            println!("Edited order: {:?}", edited_order);
-                            edited_order
-                        } else {
-                            tracing::warn!("Error editing pubkeys in order {} cancel", order.id);
-                            continue;
-                        };
-
-                        // Update order status
-                        if let Ok(order_updated) =
-                            update_order_event(&keys, new_status, &edited_order).await
-                        {
-                            // Notify users about order status changes - here order is updated
-                            notify_users_canceled_order(&order_updated, &order, maker_action).await;
-                            // trace new status
-                            tracing::info!(
-                                "Order Id {}: Reset to status {:?}",
-                                &order_updated.id,
-                                new_status
-                            );
-                            let order_id = order_updated.id;
-                            // Persist the new status. The bond slash/release
-                            // has already run above (before any DB mutation
-                            // that strips eligibility) — on persist failure
-                            // the next tick retries this branch only; the
-                            // slash is durable in `bonds.slashed_reason` and
-                            // a re-entry sees no `Locked` bond (or an
-                            // already-recorded slice child), so it is a
-                            // no-op (no duplicate notify).
-                            match order_updated.update(pool).await {
-                                Ok(_) => {
-                                    // Phase 7: a maker-responsible timeout
-                                    // cancels the order outright, terminating
-                                    // its range chain — resolve the range
-                                    // maker bond at close (settle + per-slice
-                                    // payouts + maker refund when a slice was
-                                    // slashed; plain release otherwise). The
-                                    // close helper is idempotent and a cheap
-                                    // no-op for non-range / already-resolved
-                                    // bonds; on transient failure the
-                                    // reconciliation sweep retries. The
-                                    // republish branch must NOT close: the
-                                    // order returns to the book with the
-                                    // maker still committed.
-                                    if matches!(new_status, Status::Canceled) {
-                                        bond::resolve_range_maker_bond_at_close_or_warn(
-                                            pool,
-                                            &order,
-                                            "scheduler_timeout",
-                                        )
-                                        .await;
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "scheduler_timeout: persist failed for order {} ({}); will retry next tick",
-                                        order_id, e
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
+            let now = Utc::now();
+            if let Some(next_tick) = now.checked_add_signed(
+                TimeDelta::try_seconds(exp_seconds as i64).expect("Wrong seconds value"),
+            ) {
+                info!(
+                    "Next tick for late action users check is {}",
+                    next_tick.format("%a %b %e %T %Y")
+                );
             }
+            tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;
+        }
+    });
+}
+
+/// Arkade equivalent of [`job_cancel_orders`] (`docs/flujo-venta-ark-fiat.md`).
+///
+/// Runs the same shared waiting-state core against the Arkade VHTLC backend.
+/// The `EscrowBackend` methods are `&mut self`, so the write lock is held for
+/// the duration of each tick pass and released before sleeping, letting the
+/// take handlers create VHTLCs between ticks. Bonds do not exist in Arkade
+/// mode (config validation forbids `arkade` + `anti_abuse_bond`), so the tick
+/// runs with `run_bonds = false`.
+async fn job_cancel_orders_arkade(ctx: AppContext) {
+    info!("Create a pool to connect to db");
+
+    let keys = ctx.keys().clone();
+    let Some(arkade_backend) = ctx.arkade_backend().cloned() else {
+        return error!(
+            "Failed to start Arkade scheduler job: no Arkade backend attached to context"
+        );
+    };
+    let mostro_settings = &ctx.settings().mostro;
+    let exp_seconds = mostro_settings.expiration_seconds;
+
+    tokio::spawn(async move {
+        let pool = ctx.pool();
+        loop {
+            info!("Check for order to republish for late actions of users (Arkade VHTLC)");
+
+            {
+                let mut arkade_backend = arkade_backend.write().await;
+                cancel_waiting_orders_tick(
+                    pool,
+                    &keys,
+                    exp_seconds,
+                    &mut *arkade_backend,
+                    false,
+                )
+                .await;
+            }
+
             let now = Utc::now();
             if let Some(next_tick) = now.checked_add_signed(
                 TimeDelta::try_seconds(exp_seconds as i64).expect("Wrong seconds value"),
@@ -2414,6 +2498,100 @@ mod tests {
                 .is_empty(),
             "undeliverable restore-session message must be dropped after retries"
         );
+    }
+
+    /// In Arkade mode the Lightning-only scheduler jobs must NOT start, so
+    /// `start_scheduler` must never try to build an `LndConnector` (there is
+    /// no LND in Arkade mode). This test just exercises the boot path with an
+    /// Arkade-enabled settings object and expects no panic — the Lightning
+    /// jobs would fail immediately if they ran.
+    #[tokio::test]
+    async fn start_scheduler_in_arkade_mode_skips_lightning_jobs_without_panicking() {
+        let mut settings = test_settings();
+        settings.arkade = Some(crate::arkade::config::ArkadeConfig {
+            enabled: true,
+            arkd_url: "http://localhost:8080".to_string(),
+            server_key: "abc".to_string(),
+            server_pubkey: "def".to_string(),
+            escrow_fee_wallet: "ark1fee".to_string(),
+            fee_pct: 0.0025,
+            refund_locktime_blocks: Some(144),
+        });
+        let _ = MOSTRO_CONFIG.set(settings.clone());
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool))
+            .with_settings(settings)
+            .build();
+
+        tokio::time::pause();
+        start_scheduler(ctx).await;
+        tokio::time::resume();
+    }
+
+    /// The Arkade refunder (`cancel_waiting_orders_tick` with the VHTLC
+    /// backend, `run_bonds = false`) must cancel the open VHTLC on an expired
+    /// waiting order and, for the maker-responsible timeout
+    /// (`waiting-payment` + sell), cancel the order out of the book.
+    #[tokio::test]
+    async fn arkade_cancel_tick_refunds_expired_vhtlc_and_cancels_order() {
+        init_test_settings();
+        let mut settings = test_settings();
+        settings.arkade = Some(crate::arkade::config::ArkadeConfig {
+            enabled: true,
+            arkd_url: "http://localhost:8080".to_string(),
+            server_key: "abc".to_string(),
+            server_pubkey: "def".to_string(),
+            escrow_fee_wallet: "ark1fee".to_string(),
+            fee_pct: 0.0025,
+            refund_locktime_blocks: Some(144),
+        });
+        let _ = MOSTRO_CONFIG.set(settings.clone());
+
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let backend = Arc::new(RwLock::new(crate::arkade::ArkadeBackend::new(
+            settings.arkade.clone().unwrap(),
+        )));
+        let ctx = TestContextBuilder::new()
+            .with_pool(Arc::new(pool.clone()))
+            .with_settings(settings)
+            .with_arkade_backend(backend.clone())
+            .build();
+
+        // Register a VHTLC that matches the order's hash — the escrow the
+        // refunder must cancel when the duty times out.
+        let (vhtlc_id, _preimage, _hash) = {
+            let mut b = backend.write().await;
+            b.create_hold_invoice("arkade-refunder-test", 100_000)
+                .await
+                .unwrap()
+        };
+
+        let mut order = order_for_cancel(Kind::Sell, true);
+        order.status = Status::WaitingPayment.to_string();
+        order.taken_at = Utc::now().timestamp() - 10_000;
+        order.hash = Some(vhtlc_id.clone());
+        let stored = order.create(&pool).await.unwrap();
+
+        {
+            let mut b = backend.write().await;
+            cancel_waiting_orders_tick(&pool, ctx.keys(), 900, &mut *b, false).await;
+        }
+
+        // The VHTLC is refunded back to the sender.
+        let b = backend.read().await;
+        let escrows = b.escrows.read().await;
+        let escrow = escrows.get(&vhtlc_id).expect("escrow present");
+        assert_eq!(escrow.status, crate::arkade::VhtlcStatus::Refunded);
+
+        // `waiting-payment` + sell is a maker-responsible timeout → the order
+        // is canceled, with the dev fee reset.
+        let fresh = Order::by_id(&pool, stored.id).await.unwrap().unwrap();
+        assert_eq!(fresh.status, Status::Canceled.to_string());
+        assert_eq!(fresh.dev_fee, 0);
     }
 
     /// The info job must republish as soon as the maintenance flag flips,

@@ -5,7 +5,7 @@ use crate::config::settings::Settings;
 use crate::util::{
     enqueue_order_msg, get_dev_fee, get_fiat_amount_requested, get_market_amount_and_fee,
     get_order, is_order_take_window_closed, show_cashu_escrow_request, show_hold_invoice,
-    HoldInvoiceOrigin,
+    show_vhtlc_escrow_request, HoldInvoiceOrigin,
 };
 
 use crate::db::{seller_has_pending_order, update_user_trade_index};
@@ -209,6 +209,27 @@ pub async fn take_buy_action(
             &seller_pubkey,
             order,
             request_id,
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // Arkade escrow mode: the seller (taker) must fund a VHTLC instead of a
+    // hold invoice. The buyer's payout destination arrives later (they are the
+    // maker), so `show_vhtlc_escrow_request` runs with no payment request and
+    // leaves the order in `WaitingPayment` — the buyer supplies their receiver
+    // in a subsequent step (a later phase wires the arkade `add_invoice`
+    // equivalent).
+    if Settings::is_arkade_enabled() {
+        show_vhtlc_escrow_request(
+            ctx,
+            my_keys,
+            None,
+            &buyer_pubkey,
+            &seller_pubkey,
+            order,
+            request_id,
+            HoldInvoiceOrigin::Take,
         )
         .await?;
         return Ok(());
