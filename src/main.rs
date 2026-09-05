@@ -1,5 +1,6 @@
 pub mod app;
 mod bitcoin_price;
+pub mod arkade;
 pub mod cashu;
 pub mod cli;
 pub mod config;
@@ -23,7 +24,9 @@ pub type Result<T, E = Box<dyn std::error::Error>> = std::result::Result<T, E>;
 
 use crate::app::context::AppContext;
 use crate::app::maintenance::{node_identity_guard, MaintenanceState, NodeIdentityDecision};
-use crate::app::{run, run_cashu};
+use crate::app::{run, run_arkade, run_cashu};
+use crate::arkade::config::ArkadeConfig;
+use crate::arkade::ArkadeBackend;
 use crate::cli::settings_init;
 use crate::config::{
     get_db_pool, Settings, DB_POOL, LN_STATUS, MESSAGE_QUEUES, MOSTRO_CONFIG, NOSTR_CLIENT,
@@ -37,6 +40,7 @@ use scheduler::start_scheduler;
 use std::env;
 use std::process::exit;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 use util::{get_nostr_client, invoice_subscribe};
 
@@ -225,6 +229,61 @@ async fn main() -> Result<()> {
 
         // Run the Mostro Cashu event loop and be happy!!
         return run_cashu(ctx).await;
+    }
+
+    // Arkade VHTLC escrow mode (docs/flujo-venta-ark-fiat.md): run the daemon
+    // with NO Lightning node. Build the (validation-stub) Arkade backend from
+    // the [arkade] config, attach it to the context alongside the maintenance
+    // flag, and hand off to the Arkade event loop. Every escrow/trade action
+    // is still rejected with `CantDo(InvalidAction)` until the Arkade handlers
+    // land.
+    if Settings::is_arkade_enabled() {
+        let arkade_config = ArkadeConfig::from(Settings::get_arkade().expect(
+            "arkade enabled but [arkade] settings missing after validation",
+        ));
+        tracing::info!(
+            "Starting in Arkade escrow mode — arkd at {} (LND not initialised)",
+            arkade_config.arkd_url
+        );
+        let arkade_backend = Arc::new(RwLock::new(ArkadeBackend::new(arkade_config)));
+
+        // The admin gRPC server requires a Lightning client Arkade mode never
+        // initialises, so it is not started here. Warn as Cashu mode does.
+        if RpcServer::is_enabled() {
+            tracing::warn!(
+                "[rpc].enabled = true but the admin gRPC server is NOT started in Arkade mode: \
+                 it requires a Lightning client Arkade mode does not initialise. Disable [rpc], \
+                 or run in Lightning mode, if you need the RPC API."
+            );
+        }
+
+        // Warm the anti-spam gate exactly as the other paths do.
+        install_spam_gate().await;
+
+        let settings = Arc::new(
+            MOSTRO_CONFIG
+                .get()
+                .expect("MOSTRO_CONFIG not initialized")
+                .clone(),
+        );
+        let maintenance = MaintenanceState::load(get_db_pool().as_ref()).await?;
+        if maintenance.is_enabled() {
+            tracing::warn!("Maintenance mode is ON: new orders and takes are rejected");
+        }
+        let ctx = AppContext::new(
+            get_db_pool(),
+            client.clone(),
+            settings,
+            MESSAGE_QUEUES.queue_order_msg.clone(),
+            mostro_keys.clone(),
+        )
+        .with_arkade_backend(arkade_backend)
+        .with_maintenance(maintenance);
+
+        start_scheduler(ctx.clone()).await;
+
+        // Run the Mostro Arkade event loop.
+        return run_arkade(ctx).await;
     }
 
     let mut ln_client = LndConnector::new().await?;

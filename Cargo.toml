@@ -71,6 +71,8 @@ reqwest = { version = "0.12.1", default-features = false, features = [
   "json",
   "rustls-tls",
 ] }
+hex = "0.4.3"
+sha2 = "0.10"
 mostro-core = { version = "0.14.6", features = ["sqlx"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }

@@ -603,6 +603,48 @@ pub async fn run_cashu(ctx: AppContext) -> Result<()> {
     }
 }
 
+/// Arkade-mode event loop (docs/flujo-venta-ark-fiat.md).
+///
+/// Mirrors [`run_cashu`]: there is no `ln_client`, and the connection to the
+/// Arkade escrow backend lives in the context (`ctx.arkade_backend()`) instead
+/// of a mutable `LndConnector`. During the validation-stub milestone every
+/// escrow/trade action is rejected with `CantDo(InvalidAction)`; the event-loop
+/// routes are progressively filled in as the Arkade handlers land.
+pub async fn run_arkade(ctx: AppContext) -> Result<()> {
+    let my_keys = ctx.keys();
+    let client = ctx.nostr_client();
+    let pow = ctx.settings().mostro.pow;
+    #[allow(deprecated)]
+    let accepted_kind = ctx.settings().mostro.transport.event_kind();
+    let pow_first_contact = ctx.settings().mostro.effective_pow_first_contact();
+    let gate = gate_for(accepted_kind.as_u16() == crate::config::constants::DM_EVENT_KIND);
+
+    loop {
+        let mut notifications = client.notifications();
+
+        while let Some(notification) = notifications.next().await {
+            if let ClientNotification::Event { event, .. } = notification {
+                let Some((action, message, unwrapped)) = accept_event(
+                    &ctx,
+                    &event,
+                    my_keys,
+                    pow,
+                    pow_first_contact,
+                    accepted_kind,
+                    gate,
+                )
+                .await
+                else {
+                    continue;
+                };
+                let result =
+                    dispatch_arkade(&action, message.clone(), &unwrapped, my_keys, &ctx).await;
+                finalize_dispatch(result, message, unwrapped, &action).await;
+            }
+        }
+    }
+}
+
 /// Route a validated action in Cashu mode (CF-5).
 ///
 /// The allow-list is drawn at *"escrow-independent actions that neither create
@@ -645,6 +687,32 @@ async fn dispatch_cashu(
         // Everything that advances or settles an order past the lock has no
         // handler yet during Track A — reject it cleanly. Later tracks
         // (release/cancel/dispute) replace these arms one at a time.
+        _ => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
+    }
+}
+
+/// Route a validated action in Arkade mode.
+///
+/// Mirrors [`dispatch_cashu`]'s split: escrow-independent read-only/session
+/// actions are allowed through [`handle_message_action_no_ln`]; every
+/// order-creating, bonding and escrow action is rejected with
+/// `CantDo(InvalidAction)` until the Arkade handlers land
+/// (docs/flujo-venta-ark-fiat.md).
+async fn dispatch_arkade(
+    action: &Action,
+    msg: Message,
+    event: &UnwrappedMessage,
+    my_keys: &Keys,
+    ctx: &AppContext,
+) -> Result<()> {
+    match action {
+        // Escrow-independent, read-only / session actions.
+        Action::Orders | Action::LastTradeIndex | Action::RestoreSession | Action::TradePubkey => {
+            handle_message_action_no_ln(action, msg, event, my_keys, ctx).await
+        }
+        // Everything else (order creation, takes, and every state that
+        // advances or settles an order) has no Arkade handler yet — reject
+        // it cleanly.
         _ => Err(MostroError::MostroCantDo(CantDoReason::InvalidAction).into()),
     }
 }

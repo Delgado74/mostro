@@ -1,4 +1,5 @@
 use super::{DB_POOL, MOSTRO_CONFIG, NOSTR_KEYS};
+use crate::arkade::config::ArkadeConfig;
 use crate::config::secret::take_nsec_for_init;
 use crate::config::types::{
     AntiAbuseBondSettings, CashuSettings, DatabaseSettings, EscrowMode, ExpirationSettings,
@@ -40,6 +41,11 @@ pub struct Settings {
     /// Phase 1's migration).
     #[serde(default)]
     pub price: Option<PriceSettings>,
+    /// Arkade VHTLC escrow backend configuration. Absent section ≡
+    /// disabled (Lightning mode). Mutually exclusive with `cashu`
+    /// and `anti_abuse_bond`; enforced at startup.
+    #[serde(default)]
+    pub arkade: Option<ArkadeConfig>,
 }
 
 /// Initialize the global `MOSTRO_CONFIG` and `NOSTR_KEYS` structs.
@@ -167,6 +173,14 @@ impl Settings {
         MOSTRO_CONFIG.get()?.price.as_ref()
     }
 
+    /// Retrieve the Arkade VHTLC escrow backend configuration from the
+    /// global `MOSTRO_CONFIG`. Returns `None` when the `[arkade]` block
+    /// is absent (Lightning mode) and when settings haven't been
+    /// initialized — never panics.
+    pub fn get_arkade() -> Option<&'static ArkadeConfig> {
+        MOSTRO_CONFIG.get()?.arkade.as_ref()
+    }
+
     /// True when the feature is configured AND explicitly enabled. This is
     /// the single gate every bond-related code path must check before
     /// running. Keeps the opt-in guarantee simple to audit. Returns
@@ -192,12 +206,21 @@ impl Settings {
         Self::get_cashu().is_some_and(|cfg| cfg.enabled)
     }
 
+    /// True when the `[arkade]` block is present AND explicitly enabled.
+    /// The single gate every Arkade code path must check. Returns `false`
+    /// when settings haven't been initialized.
+    pub fn is_arkade_enabled() -> bool {
+        Self::get_arkade().is_some_and(|cfg| cfg.enabled)
+    }
+
     /// The node-wide escrow mode (locked decision §4.1). `[cashu]` absent
     /// or disabled ⇒ `Lightning`. Nothing calls this on a hot path during
     /// the foundation milestone — CF-1 wires it to nothing at runtime.
     pub fn escrow_mode() -> EscrowMode {
         if Self::is_cashu_enabled() {
             EscrowMode::Cashu
+        } else if Self::is_arkade_enabled() {
+            EscrowMode::Arkade
         } else {
             EscrowMode::Lightning
         }
@@ -245,6 +268,8 @@ mod tests {
         assert!(!Settings::is_bond_enabled());
         assert!(Settings::get_cashu().is_none());
         assert!(!Settings::is_cashu_enabled());
+        assert!(Settings::get_arkade().is_none());
+        assert!(!Settings::is_arkade_enabled());
         assert!(Settings::get_price().is_none());
         assert_eq!(Settings::escrow_mode(), EscrowMode::Lightning);
     }

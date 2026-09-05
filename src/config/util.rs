@@ -73,6 +73,15 @@ fn validate_mostro_settings(settings: &Settings) -> Result<(), MostroError> {
             .is_some_and(|bond| bond.enabled),
     )?;
 
+    validate_arkade_settings(
+        settings.arkade.as_ref(),
+        settings
+            .anti_abuse_bond
+            .as_ref()
+            .is_some_and(|bond| bond.enabled),
+        settings.cashu.as_ref().is_some_and(|c| c.enabled),
+    )?;
+
     Ok(())
 }
 
@@ -123,6 +132,75 @@ fn validate_cashu_settings(
         return Err(MostroInternalErr(ServiceError::IOError(format!(
             "cashu.escrow_locktime_days ({}) must be >= 1",
             cashu.escrow_locktime_days
+        ))));
+    }
+
+    Ok(())
+}
+
+/// Validate the `[arkade]` block (Arkade VHTLC escrow backend).
+///
+/// Rules (all startup-fatal, so the daemon refuses to boot rather than
+/// silently misbehave):
+/// - `arkade.enabled` is mutually exclusive with `anti_abuse_bond.enabled`
+///   and `cashu.enabled` — a node runs exactly one escrow mode.
+/// - When enabled, `arkd_url` must be non-empty and parse as `http`/`https`.
+/// - When enabled, `server_key` and `escrow_fee_wallet` must be non-empty.
+/// - `fee_pct` must be in `[0.0, 1.0)`.
+fn validate_arkade_settings(
+    arkade: Option<&crate::arkade::config::ArkadeConfig>,
+    bond_enabled: bool,
+    cashu_enabled: bool,
+) -> Result<(), MostroError> {
+    let Some(arkade) = arkade else {
+        return Ok(());
+    };
+    if !arkade.enabled {
+        return Ok(());
+    }
+
+    if bond_enabled {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "arkade.enabled and anti_abuse_bond.enabled are mutually exclusive: \
+             a node runs bonds or Arkade escrow, never both"
+                .to_string(),
+        )));
+    }
+    if cashu_enabled {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "arkade.enabled and cashu.enabled are mutually exclusive: \
+             a node runs exactly one escrow mode"
+                .to_string(),
+        )));
+    }
+
+    let url = reqwest::Url::parse(&arkade.arkd_url).map_err(|e| {
+        MostroInternalErr(ServiceError::IOError(format!(
+            "arkade.arkd_url ({:?}) is not a valid URL: {e}",
+            arkade.arkd_url
+        )))
+    })?;
+    if !crate::util::is_http_or_https(&url) {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "arkade.arkd_url must use http or https, got scheme {:?}",
+            url.scheme()
+        ))));
+    }
+
+    if arkade.server_key.is_empty() {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "arkade.server_key must be non-empty when arkade.enabled is true".to_string(),
+        )));
+    }
+    if arkade.escrow_fee_wallet.is_empty() {
+        return Err(MostroInternalErr(ServiceError::IOError(
+            "arkade.escrow_fee_wallet must be non-empty when arkade.enabled is true".to_string(),
+        )));
+    }
+    if !(0.0..1.0).contains(&arkade.fee_pct) {
+        return Err(MostroInternalErr(ServiceError::IOError(format!(
+            "arkade.fee_pct ({}) must be in [0.0, 1.0)",
+            arkade.fee_pct
         ))));
     }
 
@@ -264,6 +342,7 @@ mod tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            arkade: None,
         }
     }
 
@@ -433,6 +512,91 @@ mod cashu_validation_tests {
 }
 
 #[cfg(test)]
+mod arkade_validation_tests {
+    use super::*;
+    use crate::arkade::config::ArkadeConfig;
+
+    fn enabled() -> ArkadeConfig {
+        ArkadeConfig {
+            enabled: true,
+            arkd_url: "https://localhost:8080".to_string(),
+            server_key: "abc123".to_string(),
+            server_pubkey: "def456".to_string(),
+            escrow_fee_wallet: "ark1fee".to_string(),
+            fee_pct: 0.0025,
+            refund_locktime_blocks: None,
+        }
+    }
+
+    #[test]
+    fn absent_block_is_valid_regardless_of_other_modes() {
+        assert!(validate_arkade_settings(None, false, false).is_ok());
+        assert!(validate_arkade_settings(None, true, true).is_ok());
+    }
+
+    #[test]
+    fn disabled_block_is_valid_even_with_other_modes() {
+        let cfg = ArkadeConfig::default();
+        assert!(validate_arkade_settings(Some(&cfg), true, true).is_ok());
+    }
+
+    #[test]
+    fn accepts_valid_enabled_config() {
+        assert!(validate_arkade_settings(Some(&enabled()), false, false).is_ok());
+        let mut cfg = enabled();
+        cfg.arkd_url = "http://localhost:8080".to_string();
+        assert!(validate_arkade_settings(Some(&cfg), false, false).is_ok());
+    }
+
+    #[test]
+    fn rejects_empty_url() {
+        let mut cfg = enabled();
+        cfg.arkd_url = String::new();
+        assert!(validate_arkade_settings(Some(&cfg), false, false).is_err());
+    }
+
+    #[test]
+    fn rejects_non_http_scheme() {
+        let mut cfg = enabled();
+        cfg.arkd_url = "ftp://localhost".to_string();
+        assert!(validate_arkade_settings(Some(&cfg), false, false).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_server_key() {
+        let mut cfg = enabled();
+        cfg.server_key = String::new();
+        assert!(validate_arkade_settings(Some(&cfg), false, false).is_err());
+    }
+
+    #[test]
+    fn rejects_empty_fee_wallet() {
+        let mut cfg = enabled();
+        cfg.escrow_fee_wallet = String::new();
+        assert!(validate_arkade_settings(Some(&cfg), false, false).is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_range_fee_pct() {
+        let mut cfg = enabled();
+        cfg.fee_pct = 1.5;
+        assert!(validate_arkade_settings(Some(&cfg), false, false).is_err());
+        cfg.fee_pct = -0.1;
+        assert!(validate_arkade_settings(Some(&cfg), false, false).is_err());
+    }
+
+    #[test]
+    fn rejects_arkade_and_bond_together() {
+        assert!(validate_arkade_settings(Some(&enabled()), true, false).is_err());
+    }
+
+    #[test]
+    fn rejects_arkade_and_cashu_together() {
+        assert!(validate_arkade_settings(Some(&enabled()), false, true).is_err());
+    }
+}
+
+#[cfg(test)]
 mod startup_validation_tests {
     use super::*;
     use crate::config::constants::{MAX_DEV_FEE_PERCENTAGE, MIN_DEV_FEE_PERCENTAGE};
@@ -452,6 +616,7 @@ mod startup_validation_tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            arkade: None,
         }
     }
 

@@ -1149,6 +1149,7 @@ mod tests {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            arkade: None,
         });
     }
 

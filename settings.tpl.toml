@@ -256,3 +256,26 @@ port = 50051
 # # Seller-recovery locktime floor in days: escrow tokens must carry
 # # locktime >= now + this. Sellers may set a longer locktime, never shorter.
 # escrow_locktime_days = 15
+
+# Arkade VHTLC escrow mode (docs/flujo-venta-ark-fiat.md). Opt-in, disabled
+# by default. When enabled the node runs WITHOUT LND and escrows trades in
+# Arkade VHTLC vtxos on the `arkd` instance configured below. Mutually
+# exclusive with [anti_abuse_bond] and [cashu] — enabling more than one
+# escrow mode is a startup error.
+#
+# [arkade]
+# enabled = false
+# # URL of the arkd daemon. Required when enabled.
+# arkd_url = "http://localhost:8080"
+# # Hex-encoded server (daemon) private key used to co-sign VHTLCs.
+# server_key = "<private_key_hex>"
+# # Hex-encoded server public key (derived from server_key if omitted).
+# server_pubkey = "<public_key_hex>"
+# # Arkade address of the fee wallet that collects trade fees
+# # (0.25% per peer = 0.5% total). Required when enabled.
+# escrow_fee_wallet = "ark1..."
+# # Trade fee fraction charged to each peer (0.0025 = 0.25%).
+# fee_pct = 0.0025
+# # Refund locktime in blocks. Inherits from [lightning].hold_invoice_cltv_delta
+# # (default 144 ≈ 24h) when omitted.
+# refund_locktime_blocks = 144

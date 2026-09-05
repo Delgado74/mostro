@@ -7,6 +7,7 @@
 //! This enables unit testing with mock implementations — see `TestContextBuilder`.
 
 use crate::app::maintenance::MaintenanceState;
+use crate::arkade::ArkadeBackend;
 use crate::cashu::CashuClient;
 use crate::config::settings::Settings;
 use mostro_core::prelude::Message;
@@ -45,6 +46,14 @@ pub struct AppContext {
     /// it here; `None` in the default Lightning mode. Track A's lock handler
     /// reads it through [`AppContext::cashu_client`].
     cashu_client: Option<Arc<CashuClient>>,
+    /// Connected Arkade VHTLC escrow backend (docs/flujo-venta-ark-fiat.md).
+    /// `Some` only in Arkade mode, where `main.rs` builds it at boot and
+    /// attaches it here; `None` in Lightning/Cashu mode. Wrapped in an
+    /// `Arc<RwLock<_>>` because the `EscrowBackend` trait methods take
+    /// `&mut self` — the scheduler's waiting-state tick calls
+    /// `cancel_hold_invoice` and the take handler calls `create_hold_invoice`
+    /// from separate tasks, so they coordinate through the lock.
+    arkade_backend: Option<Arc<RwLock<ArkadeBackend>>>,
     /// Maintenance (drain) mode flag. Defaults to a disabled, unpersisted
     /// flag; `main.rs` attaches the one loaded from `daemon_state` with
     /// [`AppContext::with_maintenance`].
@@ -70,6 +79,7 @@ impl AppContext {
             order_msg_queue,
             keys,
             cashu_client: None,
+            arkade_backend: None,
             maintenance: MaintenanceState::new(),
         }
     }
@@ -91,6 +101,14 @@ impl AppContext {
     /// `None` there.
     pub fn with_cashu_client(mut self, cashu_client: Arc<CashuClient>) -> Self {
         self.cashu_client = Some(cashu_client);
+        self
+    }
+
+    /// Attach the Arkade VHTLC escrow backend (Arkade mode). Returns a new
+    /// context; the Lightning/Cashu paths never call this, so
+    /// `arkade_backend()` stays `None` there.
+    pub fn with_arkade_backend(mut self, arkade_backend: Arc<RwLock<ArkadeBackend>>) -> Self {
+        self.arkade_backend = Some(arkade_backend);
         self
     }
 
@@ -134,6 +152,14 @@ impl AppContext {
     /// handler uses it to validate the seller's escrow token against the mint.
     pub fn cashu_client(&self) -> Option<&Arc<CashuClient>> {
         self.cashu_client.as_ref()
+    }
+
+    /// The Arkade VHTLC escrow backend, if this node runs in Arkade mode.
+    ///
+    /// `Some` only when `[arkade] enabled = true` and the backend was built
+    /// at boot; `None` in Lightning/Cashu mode.
+    pub fn arkade_backend(&self) -> Option<&Arc<RwLock<ArkadeBackend>>> {
+        self.arkade_backend.as_ref()
     }
 }
 
@@ -200,6 +226,7 @@ pub mod test_utils {
         order_msg_queue: Option<OrderMsgQueue>,
         mock_order_msg_queue: Option<MockOrderMsgQueue>,
         keys: Option<Keys>,
+        arkade_backend: Option<Arc<RwLock<ArkadeBackend>>>,
     }
 
     impl TestContextBuilder {
@@ -211,6 +238,7 @@ pub mod test_utils {
                 order_msg_queue: None,
                 mock_order_msg_queue: None,
                 keys: None,
+                arkade_backend: None,
             }
         }
 
@@ -252,6 +280,12 @@ pub mod test_utils {
             self
         }
 
+        /// Attach an Arkade VHTLC escrow backend for Arkade-mode tests.
+        pub fn with_arkade_backend(mut self, arkade_backend: Arc<RwLock<ArkadeBackend>>) -> Self {
+            self.arkade_backend = Some(arkade_backend);
+            self
+        }
+
         /// Build the test context.
         ///
         /// This is synchronous: callers must provide dependencies explicitly.
@@ -288,7 +322,11 @@ pub mod test_utils {
 
             let settings = Arc::new(settings);
 
-            AppContext::new(pool, nostr_client, settings, order_msg_queue, keys)
+            let mut ctx = AppContext::new(pool, nostr_client, settings, order_msg_queue, keys);
+            if let Some(b) = self.arkade_backend {
+                ctx = ctx.with_arkade_backend(b);
+            }
+            ctx
         }
 
         /// Build context plus mock handles used for assertions.
@@ -325,6 +363,7 @@ pub mod test_utils {
             anti_abuse_bond: None,
             cashu: None,
             price: None,
+            arkade: None,
         }
     }
 }

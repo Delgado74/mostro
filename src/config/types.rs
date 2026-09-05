@@ -207,6 +207,8 @@ pub enum EscrowMode {
     Lightning,
     /// Cashu NUT-11 2-of-3 escrow.
     Cashu,
+    /// Arkade VHTLC escrow.
+    Arkade,
 }
 
 /// Event expiration configuration settings
