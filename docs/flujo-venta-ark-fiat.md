@@ -195,7 +195,7 @@ todo la cercanía a `refundLocktime`):
 
 ## 7. Flujo de venta deriva en escrow VHTLC
 
-```
+```text
 VENDEDOR                       DAEMON (server, guarda R)          COMPRADOR
    |  crea oferta kind 38383      |                                 |
    |------------------------------->                                 |
@@ -441,7 +441,7 @@ y decidir quién lo paga (`apply_to`: `"take"`, `"make"`, o `"both"`).
 
 ### 12.2 Ciclo de vida del bond VHTLC
 
-```
+```text
                     ┌─────────────────────────────────┐
                     │   Vendedor crea orden (sell)     │
                     └──────────────┬──────────────────┘
@@ -549,6 +549,13 @@ independientemente de la capa de settlement.
   el daemon (server) aporta el `preimageHash` y vigila/confirma la fundada
   (ver §7.1). La UI de escrow ark→ark **aún no existe** en la wallet y hay
   que construirla.
+- La **entrada/salida de Ark vía Lightning se hace con solvers, no con
+  Boltz**. **Boltz ya no funciona** para este propósito y queda descartado
+  del diseño. El on/off-ramp Ark↔Lightning es responsabilidad de la
+  **wallet**, no del daemon; el escrow de Mostro es un **VHTLC
+  autocontenido** que no depende de ningún swap externo. Cualquier watcher
+  de VHTLC orientado a Boltz (p. ej. el de `ark-client`) **no aplica** a
+  este flujo.
 - El `server` no firma fuera de los escenarios de la tabla de §11.3.
 - La garantía “el vendedor no puede trampear” está soportada por la
   propiedad de `R` + la co-firma server en cada hoja (no por la cantidad
@@ -630,3 +637,119 @@ como reloj/avisador:
 **Ajuste de la fila de la tabla:** “refundLocktime venció sin disputa” → el
 server firma refund al vendedor por política de emergencia (no es
 automático, requiere co-firma server).
+
+## 15. Estado de implementación y checklist (Fase 1: Ark real)
+
+La rama `feature/vhtlc-escrow` trae el **andamiaje** completo (sección
+`[arkade]`, `EscrowMode::Arkade`, contexto, boot sin LND, dispatch de
+eventos, flujo de take y tick de cancelación del scheduler), pero todo
+corre sobre un **backend stub en memoria** (`src/arkade/backend.rs`):
+`create_hold_invoice` solo genera un `preimage`/`hash` con `rand`+`sha2`, y
+`settle`/`cancel` solo cambian un estado. **No hay conexión a `arkd`, ni
+construcción del script VHTLC, ni firma del server.**
+
+**Fase 1 = sustituir el stub por integración real con `arkd`.**
+
+### 15.1 Decisión de librería (desbloqueada)
+
+SDK oficial de Arkade en Rust: **`ark-rs` 0.11.0** —
+<https://github.com/arkade-os/rust-sdk> (crates `ark-core`, `ark-client`,
+`ark-grpc`, `ark-script`, `ark-fees`, `ark-bdk-wallet`).
+
+**`ark-core/src/vhtlc.rs` ya implementa el VHTLC completo**, por lo que **no
+hay que portar nada desde el JS** (`@arkade-os/swap`):
+
+- `VhtlcOptions { sender, receiver, server, preimage_hash,
+  refund_locktime, unilateral_claim_delay, unilateral_refund_delay,
+  unilateral_refund_without_receiver_delay }`.
+- `VhtlcScript::new(options, network)` con `address()` (→ `ArkAddress`),
+  `script_pubkey()`, `taproot_spend_info()`, `get_script_map()` y las hojas
+  `claim_script()`, `refund_script()`, `refund_without_receiver_script()`,
+  `unilateral_claim_script()`, `unilateral_refund_script()`,
+  `unilateral_refund_without_receiver_script()`.
+
+> Nota: `bark-wallet` (Second / `ark-bitcoin/bark`) es **otra**
+> implementación del protocolo Ark — **descartada**: el diseño sigue a
+> Arkade.
+
+### 15.2 Compatibilidad y dependencias (verificado)
+
+| Dependencia | Mostro (daemon) | `ark-rs` 0.11.0 | Veredicto |
+| --- | --- | --- | --- |
+| Rust (MSRV) | 1.94.0 | 1.86.0 | ✅ compatible |
+| `bitcoin` | `0.32.5` (lock `0.32.102`) | `0.32.7` | ✅ misma serie 0.32 |
+| `sqlx` | `0.9.0` | `0.8` (feature `sqlite`) | ⚠️ no activar `sqlite` |
+| `tonic` | `0.13` + `0.14` | `0.14` | ✅ (suma peso) |
+
+- **No activar la feature `sqlite` de `ark-client`**: mete `sqlx 0.8` en
+  paralelo al `sqlx 0.9` del daemon. El escrow se persiste en la **DB de
+  Mostro** con el `sqlx` existente (ver §15.4, persistencia).
+
+```toml
+ark-rs = { version = "0.11.0", features = ["client", "grpc"] }
+```
+
+### 15.3 Checklist Fase 1
+
+Config y claves:
+
+- [ ] Añadir las deps Ark al `Cargo.toml` (hoy solo hay `hex` + `sha2`).
+- [ ] Derivar la clave `server` (`XOnlyPublicKey`) desde `server_key`, o
+      leer `server_pubkey`; validar contra `arkd` al arrancar.
+- [ ] Añadir a `[arkade]` los tres delays CSV
+      (`unilateral_claim_delay`, `unilateral_refund_delay`,
+      `unilateral_refund_without_receiver_delay`) — **no existen todavía**.
+- [ ] Definir `preimage_hash` = `ripemd160(sha256(preimage))`; la `preimage`
+      la genera y custodia el server.
+
+Conexión al operador:
+
+- [ ] En `main.rs` (modo arkade) construir el `ArkadeBackend` real:
+      wallet del server vía `ark-client`, `connect(arkd_url)`, leer
+      `server_info` (pubkey del server, fees, network). Hoy `main.rs` no
+      conecta nada.
+
+Backend real (reemplazar el stub en `src/arkade/backend.rs`):
+
+- [ ] `create_hold_invoice` → construir `VhtlcOptions` + `VhtlcScript`,
+      devolver `address()`/id.
+- [ ] **Observación de estado del VHTLC** (reemplazo de
+      `invoice_subscribe`): transición real a `VhtlcStatus::Funded`/
+      `Confirmed` cuando el vendedor funda (ver §14.1). Hoy esos estados
+      **nunca** se alcanzan y el trade no puede pasar a `Active`.
+      *Pendiente de verificar:* el equivalente Rust de `readLockupFate`
+      (eventos de contrato de `ark-client` o el indexer). El watcher VHTLC
+      de `ark-client` está orientado a **Boltz** → no aplica (ver §13).
+- [ ] `settle_hold_invoice` → co-firmar la hoja `claim` revelando la
+      `preimage`; pagar al `receiver`.
+- [ ] `cancel_hold_invoice` → co-firmar la hoja `refund` /
+      `refund_without_receiver` hacia el `sender`.
+- [ ] `chain_height()` → altura del tip (para el `refund_locktime`).
+
+Persistencia:
+
+- [ ] Nueva migración en `migrations/` + helpers en `src/db.rs` para
+      `PendingVhtlc` (id, `preimage`, `preimage_hash`, address,
+      `refund_locktime`, status, `order_id`). Hoy vive en memoria y se
+      pierde al reiniciar.
+
+Entorno y pruebas:
+
+- [ ] Levantar `arkd` regtest (el SDK trae `arkade-regtest` con Docker +
+      Node y `.env.regtest`; `just regtest-start`).
+- [ ] Unit: mapeo config → `VhtlcOptions` y máquina de estados del escrow.
+- [ ] e2e: fund → observar → `claim`/`refund` contra regtest.
+
+### 15.4 Fases posteriores (solo referencia)
+
+- **Fase 2 — Liquidación y disputa:** rama arkade en `release`,
+  `admin_settle`, `admin_cancel`, `admin_take_dispute`, `fiat_sent`,
+  `dispute`; retirar `do_payment`/`reconcile_inflight_payout` (§8).
+- **Fase 3 — Destino del comprador y fees:** acción equivalente a
+  `add_invoice` para recoger el receiver del comprador (hoy `take_buy` pasa
+  `None`) y reparto de la tarifa a `escrow_fee_wallet` (§5.1).
+- **Fase 4 — Scheduler de escrow:** reloj de `refundLocktime`
+  (avisos + escalado + refund de emergencia) además del tick de
+  waiting-state actual (§14.2).
+- **Fase 5 — Infra:** persistencia completa, gRPC admin en modo arkade
+  (hoy no arranca), wizard de config y bonds (§12).
