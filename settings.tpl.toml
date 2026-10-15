@@ -279,3 +279,10 @@ port = 50051
 # # Refund locktime in blocks. Inherits from [lightning].hold_invoice_cltv_delta
 # # (default 144 ≈ 24h) when omitted.
 # refund_locktime_blocks = 144
+# # CSV delay (blocks) for the VHTLC unilateral claim leaf. Defaults to 17.
+# unilateral_claim_delay = 17
+# # CSV delay (blocks) for the VHTLC unilateral refund leaf. Defaults to 144.
+# unilateral_refund_delay = 144
+# # CSV delay (blocks) for the unilateral refund-without-receiver leaf.
+# # Defaults to 144.
+# unilateral_refund_without_receiver_delay = 144

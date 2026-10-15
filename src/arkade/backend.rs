@@ -1,5 +1,7 @@
+use ark_rs::core::server::Info;
 use ark_rs::core::vhtlc::{VhtlcOptions, VhtlcScript};
 use ark_rs::core::ArkAddress;
+use ark_rs::grpc::Client as GrpcClient;
 use async_trait::async_trait;
 use bitcoin::hashes::{ripemd160, Hash};
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
@@ -86,12 +88,15 @@ pub struct PendingBond {
     pub status: VhtlcStatus,
 }
 
-/// Arkade VHTLC escrow backend (stub implementation).
+/// Arkade VHTLC escrow backend.
 ///
-/// This is a **validation stub** that tracks VHTLC state in memory and
-/// logs operations. It does NOT connect to `arkd` — real integration
-/// arrives in a later phase. The stub lets us validate the escrow flow
-/// logic before wiring up the actual Ark RPC.
+/// Escrow/bond actions are still a **validation stub** that tracks state in
+/// memory and logs operations; the value-objects (`server_xonly`,
+/// `preimage_hash`, `vhtlc_script`) are real. The backend can [`connect`] to a
+/// live `arkd` to fetch `server_info` (network, signer, delays, dust) — this is
+/// the transport the observation and settlement phases will build on.
+///
+/// [`connect`]: ArkadeBackend::connect
 ///
 /// Implements the `EscrowBackend` trait to maintain compatibility with
 /// the existing handler infrastructure.
@@ -102,6 +107,12 @@ pub struct ArkadeBackend {
     pub escrows: Arc<RwLock<HashMap<String, PendingVhtlc>>>,
     /// Pending bonds keyed by preimage hash.
     pub bonds: Arc<RwLock<HashMap<String, PendingBond>>>,
+    /// Connected `arkd` gRPC transport; `None` until [`connect`] succeeds.
+    ///
+    /// [`connect`]: ArkadeBackend::connect
+    pub client: Option<GrpcClient>,
+    /// Last `server_info` fetched from `arkd`.
+    pub server_info: Option<Info>,
 }
 
 impl ArkadeBackend {
@@ -110,7 +121,54 @@ impl ArkadeBackend {
             config,
             escrows: Arc::new(RwLock::new(HashMap::new())),
             bonds: Arc::new(RwLock::new(HashMap::new())),
+            client: None,
+            server_info: None,
         }
+    }
+
+    /// Connect to `arkd` at `config.arkd_url` and cache its `server_info`.
+    ///
+    /// Establishes the gRPC transport only (no wallet needed for
+    /// `GetInfo`). Stores the connected client and the fetched server info on
+    /// the backend so later phases (address watching, settlement) can reuse
+    /// them. Safe to call again to refresh the connection.
+    pub async fn connect(&mut self) -> Result<(), MostroError> {
+        let mut client = GrpcClient::new(self.config.arkd_url.clone());
+        client.connect().await.map_err(|e| {
+            arkade_connection_error(format!("connect {}: {e}", self.config.arkd_url))
+        })?;
+        let info = client
+            .get_info()
+            .await
+            .map_err(|e| arkade_connection_error(format!("get_info: {e}")))?;
+
+        tracing::info!(
+            "Arkade backend connected to arkd at {} — network={:?}, signer={}, \
+             unilateral_exit_delay={:?}, dust={}",
+            self.config.arkd_url,
+            info.network,
+            info.signer_pk,
+            info.unilateral_exit_delay,
+            info.dust
+        );
+
+        self.client = Some(client);
+        self.server_info = Some(info);
+        Ok(())
+    }
+
+    /// The cached `server_info` from `arkd`, if [`connect`] has run.
+    ///
+    /// [`connect`]: ArkadeBackend::connect
+    pub fn server_info(&self) -> Option<&Info> {
+        self.server_info.as_ref()
+    }
+
+    /// The `arkd` network, if known (from a successful [`connect`]).
+    ///
+    /// [`connect`]: ArkadeBackend::connect
+    pub fn network(&self) -> Option<Network> {
+        self.server_info.as_ref().map(|info| info.network)
     }
 
     /// Get the refund locktime for VHTLC contracts.
@@ -260,6 +318,12 @@ fn arkade_config_error(msg: String) -> MostroError {
     )))
 }
 
+fn arkade_connection_error(msg: String) -> MostroError {
+    MostroInternalErr(ServiceError::LnNodeError(format!(
+        "arkade connection error: {msg}"
+    )))
+}
+
 fn arkade_not_implemented(op: &str) -> MostroError {
     MostroInternalErr(ServiceError::HoldInvoiceError(format!(
         "arkade escrow backend: {op} not implemented (validation stub)"
@@ -313,10 +377,7 @@ impl EscrowBackend for ArkadeBackend {
             status: VhtlcStatus::Pending,
         };
 
-        self.escrows
-            .write()
-            .await
-            .insert(hash_hex.clone(), escrow);
+        self.escrows.write().await.insert(hash_hex.clone(), escrow);
 
         // Return (vhtlc_id, preimage, hash) — the "bolt11" equivalent
         // is the VHTLC identifier that clients use to track the escrow
@@ -339,12 +400,9 @@ impl EscrowBackend for ArkadeBackend {
 
         // Find the escrow by preimage
         let mut escrows = self.escrows.write().await;
-        let escrow = escrows.values_mut().find(|e| {
-            e.preimage
-                .as_ref()
-                .map(|p| p == preimage)
-                .unwrap_or(false)
-        });
+        let escrow = escrows
+            .values_mut()
+            .find(|e| e.preimage.as_ref().map(|p| p == preimage).unwrap_or(false));
 
         match escrow {
             Some(e) => {
@@ -424,13 +482,41 @@ mod tests {
         }
     }
 
+    #[test]
+    fn new_backend_starts_disconnected() {
+        let backend = ArkadeBackend::new(test_config());
+        assert!(backend.server_info().is_none());
+        assert!(backend.network().is_none());
+        assert!(backend.client.is_none());
+    }
+
+    /// Live check against the public mutinynet operator. Ignored by default
+    /// because it needs network access; run with:
+    /// `cargo test -- --ignored connects_to_mutinynet_arkd`.
+    #[tokio::test]
+    #[ignore = "requires network access to the public mutinynet arkd"]
+    async fn connects_to_mutinynet_arkd() {
+        let mut config = test_config();
+        config.arkd_url = "https://mutinynet.arkade.sh".to_string();
+        let mut backend = ArkadeBackend::new(config);
+
+        backend.connect().await.unwrap();
+
+        let info = backend.server_info().expect("server_info cached");
+        assert_eq!(info.network, Network::Signet);
+        assert_eq!(backend.network(), Some(Network::Signet));
+        assert!(!info.signer_pk.to_string().is_empty());
+    }
+
     #[tokio::test]
     async fn arkade_backend_stub_returns_typed_error_without_panicking() {
         let config = test_config();
         let mut backend = ArkadeBackend::new(config);
 
         // Test settle with unknown preimage
-        let settle = crate::escrow::EscrowBackend::settle_hold_invoice(&mut backend, "unknown_preimage").await;
+        let settle =
+            crate::escrow::EscrowBackend::settle_hold_invoice(&mut backend, "unknown_preimage")
+                .await;
         assert!(settle.is_err());
 
         // Test cancel with unknown hash
@@ -455,7 +541,8 @@ mod tests {
 
         // Settle with the preimage
         let preimage_hex = hex::encode(&preimage);
-        let settle = crate::escrow::EscrowBackend::settle_hold_invoice(&mut backend, &preimage_hex).await;
+        let settle =
+            crate::escrow::EscrowBackend::settle_hold_invoice(&mut backend, &preimage_hex).await;
         assert!(settle.is_ok());
 
         // Verify status

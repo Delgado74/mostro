@@ -545,8 +545,7 @@ async fn cancel_waiting_orders_tick<L: EscrowBackend + SettleLightning + Send>(
             // acting, so the hold-invoice/VHTLC cancel, the bond blame,
             // and the cancel/republish below all run against the
             // order's *current* duty rather than the snapshot's.
-            let Some(order) =
-                reconfirm_timeout_eligibility(pool, order.id, exp_seconds).await
+            let Some(order) = reconfirm_timeout_eligibility(pool, order.id, exp_seconds).await
             else {
                 continue;
             };
@@ -581,7 +580,10 @@ async fn cancel_waiting_orders_tick<L: EscrowBackend + SettleLightning + Send>(
                     // seller already paid it and gets their funds
                     // back.
                     if order.status == Status::WaitingPayment.to_string() {
-                        info!("Order Id {}: Hold invoice canceled - seller did not pay it in time", &order.id);
+                        info!(
+                            "Order Id {}: Hold invoice canceled - seller did not pay it in time",
+                            &order.id
+                        );
                     } else {
                         info!("Order Id {}: Funds returned to seller - buyer did not send their invoice in time", &order.id);
                     }
@@ -659,60 +661,56 @@ async fn cancel_waiting_orders_tick<L: EscrowBackend + SettleLightning + Send>(
                     }
                 }
 
-                let (maker_action, new_status, edited_order) =
-                    match (order_status, order_kind) {
-                        (Status::WaitingBuyerInvoice, Kind::Sell)
-                        | (Status::WaitingPayment, Kind::Buy) => {
-                            // Update order status
-                            let _ = update_order_to_initial_state(
-                                pool,
-                                order.id,
-                                order.amount,
-                                order.fee,
-                                order.dev_fee,
-                            )
-                            .await;
-                            info!(
-                                "Republishing order Id {}, {}",
-                                order.id,
-                                if order_status == Status::WaitingPayment {
-                                    "taker (seller) did not pay the hold invoice in time"
-                                } else {
-                                    "taker (buyer) did not send their invoice in time"
-                                }
-                            );
-                            (
-                                Some(Action::NewOrder),
-                                Status::Pending,
-                                edit_pubkeys_order(pool, &order).await,
-                            )
-                        }
-                        (Status::WaitingBuyerInvoice, Kind::Buy)
-                        | (Status::WaitingPayment, Kind::Sell) => {
-                            // Update order status
-                            info!(
-                                "Canceled order Id {}, {}",
-                                order.id,
-                                if order_status == Status::WaitingPayment {
-                                    "maker (seller) did not pay the hold invoice in time"
-                                } else {
-                                    "maker (buyer) did not send their invoice in time"
-                                }
-                            );
-                            (
-                                Some(Action::Canceled),
-                                Status::Canceled,
-                                edit_pubkeys_order(pool, &order).await,
-                            )
-                        }
-                        _ => {
-                            tracing::info!(
-                                "Order Id {} not available for cancel",
-                                &order.id
-                            );
-                            continue;
-                        }
-                    };
+                let (maker_action, new_status, edited_order) = match (order_status, order_kind) {
+                    (Status::WaitingBuyerInvoice, Kind::Sell)
+                    | (Status::WaitingPayment, Kind::Buy) => {
+                        // Update order status
+                        let _ = update_order_to_initial_state(
+                            pool,
+                            order.id,
+                            order.amount,
+                            order.fee,
+                            order.dev_fee,
+                        )
+                        .await;
+                        info!(
+                            "Republishing order Id {}, {}",
+                            order.id,
+                            if order_status == Status::WaitingPayment {
+                                "taker (seller) did not pay the hold invoice in time"
+                            } else {
+                                "taker (buyer) did not send their invoice in time"
+                            }
+                        );
+                        (
+                            Some(Action::NewOrder),
+                            Status::Pending,
+                            edit_pubkeys_order(pool, &order).await,
+                        )
+                    }
+                    (Status::WaitingBuyerInvoice, Kind::Buy)
+                    | (Status::WaitingPayment, Kind::Sell) => {
+                        // Update order status
+                        info!(
+                            "Canceled order Id {}, {}",
+                            order.id,
+                            if order_status == Status::WaitingPayment {
+                                "maker (seller) did not pay the hold invoice in time"
+                            } else {
+                                "maker (buyer) did not send their invoice in time"
+                            }
+                        );
+                        (
+                            Some(Action::Canceled),
+                            Status::Canceled,
+                            edit_pubkeys_order(pool, &order).await,
+                        )
+                    }
+                    _ => {
+                        tracing::info!("Order Id {} not available for cancel", &order.id);
+                        continue;
+                    }
+                };
 
                 // Get edited order to use for update_order_event
                 let edited_order = if let Ok(edited_order) = edited_order {
@@ -724,8 +722,7 @@ async fn cancel_waiting_orders_tick<L: EscrowBackend + SettleLightning + Send>(
                 };
 
                 // Update order status
-                if let Ok(order_updated) =
-                    update_order_event(keys, new_status, &edited_order).await
+                if let Ok(order_updated) = update_order_event(keys, new_status, &edited_order).await
                 {
                     // Notify users about order status changes - here order is updated
                     notify_users_canceled_order(&order_updated, &order, maker_action).await;
@@ -845,14 +842,8 @@ async fn job_cancel_orders_arkade(ctx: AppContext) {
 
             {
                 let mut arkade_backend = arkade_backend.write().await;
-                cancel_waiting_orders_tick(
-                    pool,
-                    &keys,
-                    exp_seconds,
-                    &mut *arkade_backend,
-                    false,
-                )
-                .await;
+                cancel_waiting_orders_tick(pool, &keys, exp_seconds, &mut *arkade_backend, false)
+                    .await;
             }
 
             let now = Utc::now();

@@ -424,7 +424,9 @@ mod tests {
 
         // Act + Assert: Cashu escrow mode ignores the payload entirely.
         assert_eq!(
-            validate_buyer_invoice(&msg, &order, true, false).await.unwrap(),
+            validate_buyer_invoice(&msg, &order, true, false)
+                .await
+                .unwrap(),
             None
         );
 

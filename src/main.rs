@@ -1,6 +1,6 @@
 pub mod app;
-mod bitcoin_price;
 pub mod arkade;
+mod bitcoin_price;
 pub mod cashu;
 pub mod cli;
 pub mod config;
@@ -238,14 +238,20 @@ async fn main() -> Result<()> {
     // is still rejected with `CantDo(InvalidAction)` until the Arkade handlers
     // land.
     if Settings::is_arkade_enabled() {
-        let arkade_config = ArkadeConfig::from(Settings::get_arkade().expect(
-            "arkade enabled but [arkade] settings missing after validation",
-        ));
+        let arkade_config = ArkadeConfig::from(
+            Settings::get_arkade()
+                .expect("arkade enabled but [arkade] settings missing after validation"),
+        );
         tracing::info!(
             "Starting in Arkade escrow mode — arkd at {} (LND not initialised)",
             arkade_config.arkd_url
         );
-        let arkade_backend = Arc::new(RwLock::new(ArkadeBackend::new(arkade_config)));
+        let mut arkade_backend_inner = ArkadeBackend::new(arkade_config);
+        // Establish the arkd transport and cache server_info before serving.
+        // A hard failure here is fatal: without server_info we cannot watch or
+        // settle VHTLCs, so fail fast instead of running in a broken mode.
+        arkade_backend_inner.connect().await?;
+        let arkade_backend = Arc::new(RwLock::new(arkade_backend_inner));
 
         // The admin gRPC server requires a Lightning client Arkade mode never
         // initialises, so it is not started here. Warn as Cashu mode does.

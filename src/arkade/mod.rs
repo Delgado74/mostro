@@ -8,8 +8,8 @@ mod vhtlc_spike {
     #[test]
     fn ark_core_vhtlc_constructs_and_encodes_address() {
         use ark_rs::core::vhtlc::{VhtlcOptions, VhtlcScript};
-        use bitcoin::secp256k1::{Secp256k1, SecretKey, Keypair, XOnlyPublicKey};
         use bitcoin::hashes::{ripemd160, Hash};
+        use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
         use bitcoin::{Network, Sequence};
 
         let secp = Secp256k1::new();

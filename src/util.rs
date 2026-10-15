@@ -1875,12 +1875,9 @@ pub async fn show_vhtlc_escrow_request(
     // pre-trade window while the VHTLC was being created, persisting this
     // snapshot would resurrect the row and strand the VHTLC. On a miss,
     // cancel the orphaned VHTLC and bail.
-    let won = db::cas_complete_pretrade_take(
-        pool,
-        &order_updated,
-        origin.allows_waiting_buyer_invoice(),
-    )
-    .await?;
+    let won =
+        db::cas_complete_pretrade_take(pool, &order_updated, origin.allows_waiting_buyer_invoice())
+            .await?;
     if !won {
         if let Some(backend) = ctx.arkade_backend() {
             let mut backend = backend.write().await;
@@ -3912,7 +3909,10 @@ mod tests {
             .iter()
             .find(|(_, pk)| *pk == seller)
             .expect("seller funding request");
-        assert_eq!(seller_msg.get_inner_message_kind().action, Action::PayInvoice);
+        assert_eq!(
+            seller_msg.get_inner_message_kind().action,
+            Action::PayInvoice
+        );
         match seller_msg.get_inner_message_kind().get_payload() {
             Some(Payload::PaymentRequest(Some(so), pr, None)) => {
                 assert_eq!(pr, &hash);
@@ -3999,7 +3999,10 @@ mod tests {
         let winner = escrows.get(db.hash.as_ref().unwrap()).unwrap();
         assert_eq!(winner.status, crate::arkade::VhtlcStatus::Pending);
         assert_eq!(
-            escrows.values().filter(|e| e.status == crate::arkade::VhtlcStatus::Refunded).count(),
+            escrows
+                .values()
+                .filter(|e| e.status == crate::arkade::VhtlcStatus::Refunded)
+                .count(),
             1,
             "the orphaned VHTLC from the losing take must be refunded"
         );

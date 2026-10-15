@@ -708,10 +708,15 @@ Config y claves:
 
 Conexión al operador:
 
-- [ ] En `main.rs` (modo arkade) construir el `ArkadeBackend` real:
-      wallet del server vía `ark-client`, `connect(arkd_url)`, leer
-      `server_info` (pubkey del server, fees, network). Hoy `main.rs` no
-      conecta nada.
+- [x] `ArkadeBackend::connect()`: transporte gRPC con `ark-grpc`
+      (`Client::new(url).connect().get_info()`, sin wallet) y caché de
+      `server_info` (network, `signer_pk`, delays, dust). `main.rs` conecta al
+      arrancar en modo arkade y **falla rápido** si no hay `server_info`.
+      Verificado contra el operador público de mutinynet
+      (`https://mutinynet.arkade.sh`, `Network::Signet`).
+      *Pendiente (Fase 2+):* wallet del server vía `ark-client` para
+      co-firmar/fundar; hoy `connect()` no inicializa wallet (no hace falta
+      para `GetInfo`).
 
 Backend real (reemplazar el stub en `src/arkade/backend.rs`):
 
