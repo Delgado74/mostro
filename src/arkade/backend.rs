@@ -1,5 +1,10 @@
+use ark_rs::core::vhtlc::VhtlcOptions;
 use async_trait::async_trait;
+use bitcoin::hashes::{ripemd160, Hash};
+use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
+use bitcoin::Sequence;
 use mostro_core::prelude::*;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -9,6 +14,14 @@ use tokio::sync::RwLock;
 use crate::app::bond::slash::SettleLightning;
 use crate::arkade::config::ArkadeConfig;
 use crate::escrow::EscrowBackend;
+
+/// Default CSV delay (blocks) for the unilateral claim leaf when the node does
+/// not override it. Mirrors the Arkade/Boltz swap fixture.
+const DEFAULT_UNILATERAL_CLAIM_DELAY_BLOCKS: u32 = 17;
+/// Default CSV delay (blocks) for the unilateral refund leaf.
+const DEFAULT_UNILATERAL_REFUND_DELAY_BLOCKS: u32 = 144;
+/// Default CSV delay (blocks) for the unilateral refund-without-receiver leaf.
+const DEFAULT_UNILATERAL_REFUND_WITHOUT_RECEIVER_DELAY_BLOCKS: u32 = 144;
 
 /// Pending VHTLC escrow record. Tracked in-memory while the escrow is
 /// active; persisted to DB for durability.
@@ -126,6 +139,89 @@ impl ArkadeBackend {
         let fee = (trade_amount_sats as f64 * self.config.fee_pct) as i64;
         (fee, fee)
     }
+
+    /// Compute the VHTLC `preimage_hash` = `ripemd160(sha256(preimage))`, the
+    /// commitment embedded in the contract script.
+    pub fn preimage_hash(preimage: &[u8]) -> ripemd160::Hash {
+        let sha = Sha256::digest(preimage);
+        ripemd160::Hash::hash(sha.as_slice())
+    }
+
+    /// Server x-only public key that acts as the VHTLC co-signer.
+    ///
+    /// Uses `server_pubkey` verbatim when provided (hex, 32 bytes); otherwise
+    /// derives it from `server_key` (hex, 32-byte secret key).
+    pub fn server_xonly(&self) -> Result<XOnlyPublicKey, MostroError> {
+        if !self.config.server_pubkey.is_empty() {
+            let bytes = hex::decode(&self.config.server_pubkey)
+                .map_err(|e| arkade_config_error(format!("invalid server_pubkey hex: {e}")))?;
+            return XOnlyPublicKey::from_slice(&bytes)
+                .map_err(|e| arkade_config_error(format!("invalid server_pubkey: {e}")));
+        }
+        let bytes = hex::decode(&self.config.server_key)
+            .map_err(|e| arkade_config_error(format!("invalid server_key hex: {e}")))?;
+        let sk = SecretKey::from_slice(&bytes)
+            .map_err(|e| arkade_config_error(format!("invalid server_key: {e}")))?;
+        let secp = Secp256k1::new();
+        Ok(Keypair::from_secret_key(&secp, &sk).x_only_public_key().0)
+    }
+
+    /// Build the [`VhtlcOptions`] contract template for a trade escrow.
+    ///
+    /// Maps the node's `[arkade]` delays to their CSV `Sequence` encodings
+    /// (falling back to the documented defaults), embeds the server as the
+    /// co-signer, and validates the result. `sender`/`receiver` are the two
+    /// trade peers; `preimage_hash` is `ripemd160(sha256(preimage))`.
+    pub fn vhtlc_options(
+        &self,
+        sender: XOnlyPublicKey,
+        receiver: XOnlyPublicKey,
+        preimage_hash: ripemd160::Hash,
+    ) -> Result<VhtlcOptions, MostroError> {
+        let options = VhtlcOptions {
+            sender,
+            receiver,
+            server: self.server_xonly()?,
+            preimage_hash,
+            refund_locktime: self.refund_locktime(),
+            unilateral_claim_delay: csv_to_sequence(
+                self.config
+                    .unilateral_claim_delay
+                    .unwrap_or(DEFAULT_UNILATERAL_CLAIM_DELAY_BLOCKS),
+                "unilateral_claim_delay",
+            )?,
+            unilateral_refund_delay: csv_to_sequence(
+                self.config
+                    .unilateral_refund_delay
+                    .unwrap_or(DEFAULT_UNILATERAL_REFUND_DELAY_BLOCKS),
+                "unilateral_refund_delay",
+            )?,
+            unilateral_refund_without_receiver_delay: csv_to_sequence(
+                self.config
+                    .unilateral_refund_without_receiver_delay
+                    .unwrap_or(DEFAULT_UNILATERAL_REFUND_WITHOUT_RECEIVER_DELAY_BLOCKS),
+                "unilateral_refund_without_receiver_delay",
+            )?,
+        };
+        options
+            .validate()
+            .map_err(|e| arkade_config_error(format!("invalid VHTLC options: {e}")))?;
+        Ok(options)
+    }
+}
+
+/// Encode a block count as a BIP68 relative-locktime `Sequence`.
+fn csv_to_sequence(blocks: u32, field: &str) -> Result<Sequence, MostroError> {
+    let height = u16::try_from(blocks).map_err(|_| {
+        arkade_config_error(format!("{field} = {blocks} exceeds CSV block max (65535)"))
+    })?;
+    Ok(Sequence::from_height(height))
+}
+
+fn arkade_config_error(msg: String) -> MostroError {
+    MostroInternalErr(ServiceError::HoldInvoiceError(format!(
+        "arkade config error: {msg}"
+    )))
 }
 
 fn arkade_not_implemented(op: &str) -> MostroError {
@@ -365,5 +461,120 @@ mod tests {
 
         let backend = ArkadeBackend::new(config);
         assert_eq!(backend.refund_locktime(), 432);
+    }
+
+    fn valid_secret_hex(byte: u8) -> String {
+        hex::encode([byte; 32])
+    }
+
+    fn xonly_from(byte: u8) -> XOnlyPublicKey {
+        let secp = Secp256k1::new();
+        let sk = SecretKey::from_slice(&[byte; 32]).unwrap();
+        Keypair::from_secret_key(&secp, &sk).x_only_public_key().0
+    }
+
+    #[test]
+    fn server_xonly_derives_from_private_key() {
+        let mut config = test_config();
+        config.server_key = valid_secret_hex(1);
+        config.server_pubkey = String::new();
+
+        let backend = ArkadeBackend::new(config);
+        assert_eq!(backend.server_xonly().unwrap(), xonly_from(1));
+    }
+
+    #[test]
+    fn server_xonly_prefers_explicit_pubkey() {
+        let mut config = test_config();
+        config.server_key = valid_secret_hex(1);
+        config.server_pubkey = hex::encode(xonly_from(2).serialize());
+
+        let backend = ArkadeBackend::new(config);
+        assert_eq!(backend.server_xonly().unwrap(), xonly_from(2));
+    }
+
+    #[test]
+    fn server_xonly_rejects_bad_key() {
+        let mut config = test_config();
+        config.server_key = "nothex".to_string();
+        config.server_pubkey = String::new();
+
+        let backend = ArkadeBackend::new(config);
+        assert!(backend.server_xonly().is_err());
+    }
+
+    #[test]
+    fn vhtlc_options_use_defaults_and_validate() {
+        let mut config = test_config();
+        config.server_key = valid_secret_hex(3);
+        config.server_pubkey = String::new();
+
+        let backend = ArkadeBackend::new(config);
+        let opts = backend
+            .vhtlc_options(
+                xonly_from(1),
+                xonly_from(2),
+                ArkadeBackend::preimage_hash(b"secret"),
+            )
+            .unwrap();
+
+        assert_eq!(opts.server, xonly_from(3));
+        assert_eq!(opts.refund_locktime, 144);
+        assert_eq!(opts.unilateral_claim_delay, Sequence::from_height(17));
+        assert_eq!(opts.unilateral_refund_delay, Sequence::from_height(144));
+        assert!(opts.validate().is_ok());
+    }
+
+    #[test]
+    fn vhtlc_options_respect_configured_delays() {
+        let mut config = test_config();
+        config.server_key = valid_secret_hex(3);
+        config.server_pubkey = String::new();
+        config.unilateral_claim_delay = Some(20);
+        config.unilateral_refund_delay = Some(200);
+        config.unilateral_refund_without_receiver_delay = Some(300);
+
+        let backend = ArkadeBackend::new(config);
+        let opts = backend
+            .vhtlc_options(
+                xonly_from(1),
+                xonly_from(2),
+                ArkadeBackend::preimage_hash(b"x"),
+            )
+            .unwrap();
+
+        assert_eq!(opts.unilateral_claim_delay, Sequence::from_height(20));
+        assert_eq!(opts.unilateral_refund_delay, Sequence::from_height(200));
+        assert_eq!(
+            opts.unilateral_refund_without_receiver_delay,
+            Sequence::from_height(300)
+        );
+    }
+
+    #[test]
+    fn vhtlc_options_reject_oversized_delay() {
+        let mut config = test_config();
+        config.server_key = valid_secret_hex(3);
+        config.server_pubkey = String::new();
+        config.unilateral_claim_delay = Some(u16::MAX as u32 + 1);
+
+        let backend = ArkadeBackend::new(config);
+        assert!(backend
+            .vhtlc_options(
+                xonly_from(1),
+                xonly_from(2),
+                ArkadeBackend::preimage_hash(b"x")
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn preimage_hash_is_ripemd160_of_sha256() {
+        let preimage = [7u8; 32];
+        let expected = {
+            let sha = Sha256::digest(preimage);
+            ripemd160::Hash::hash(sha.as_slice())
+        };
+        assert_eq!(ArkadeBackend::preimage_hash(&preimage), expected);
     }
 }
