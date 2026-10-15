@@ -41,6 +41,21 @@ pub struct ArkadeConfig {
     /// `refundLocktime` parameter for VHTLC contracts.
     #[serde(default)]
     pub refund_locktime_blocks: Option<u32>,
+
+    /// Unilateral claim delay for VHTLC (CSV relative locktime).
+    /// Maps to `VhtlcOptions.unilateral_claim_delay`.
+    #[serde(default)]
+    pub unilateral_claim_delay: Option<u32>,
+
+    /// Unilateral refund delay for VHTLC (CSV relative locktime).
+    /// Maps to `VhtlcOptions.unilateral_refund_delay`.
+    #[serde(default)]
+    pub unilateral_refund_delay: Option<u32>,
+
+    /// Unilateral refund without receiver delay for VHTLC (CSV relative locktime).
+    /// Maps to `VhtlcOptions.unilateral_refund_without_receiver_delay`.
+    #[serde(default)]
+    pub unilateral_refund_without_receiver_delay: Option<u32>,
 }
 
 fn default_fee_pct() -> f64 {
@@ -57,6 +72,9 @@ impl Default for ArkadeConfig {
             escrow_fee_wallet: String::new(),
             fee_pct: default_fee_pct(),
             refund_locktime_blocks: None,
+            unilateral_claim_delay: None,
+            unilateral_refund_delay: None,
+            unilateral_refund_without_receiver_delay: None,
         }
     }
 }
@@ -90,6 +108,9 @@ mod tests {
             escrow_fee_wallet: "ark1xyz".to_string(),
             fee_pct: 0.005,
             refund_locktime_blocks: Some(432),
+            unilateral_claim_delay: None,
+            unilateral_refund_delay: None,
+            unilateral_refund_without_receiver_delay: None,
         };
         let clone = ArkadeConfig::from(&cfg);
         assert_eq!(cfg.enabled, clone.enabled);

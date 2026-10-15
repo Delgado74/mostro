@@ -524,7 +524,10 @@ mod arkade_validation_tests {
             server_pubkey: "def456".to_string(),
             escrow_fee_wallet: "ark1fee".to_string(),
             fee_pct: 0.0025,
-            refund_locktime_blocks: None,
+            refund_locktime_blocks: Some(144),
+            unilateral_claim_delay: None,
+            unilateral_refund_delay: None,
+            unilateral_refund_without_receiver_delay: None,
         }
     }
 
