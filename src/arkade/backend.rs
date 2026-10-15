@@ -1,8 +1,9 @@
-use ark_rs::core::vhtlc::VhtlcOptions;
+use ark_rs::core::vhtlc::{VhtlcOptions, VhtlcScript};
+use ark_rs::core::ArkAddress;
 use async_trait::async_trait;
 use bitcoin::hashes::{ripemd160, Hash};
 use bitcoin::secp256k1::{Keypair, Secp256k1, SecretKey, XOnlyPublicKey};
-use bitcoin::Sequence;
+use bitcoin::{Network, Sequence};
 use mostro_core::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -140,8 +141,15 @@ impl ArkadeBackend {
         (fee, fee)
     }
 
-    /// Compute the VHTLC `preimage_hash` = `ripemd160(sha256(preimage))`, the
-    /// commitment embedded in the contract script.
+    /// Compute the VHTLC `preimage_hash` = `HASH160(preimage)` =
+    /// `ripemd160(sha256(preimage))`, the commitment embedded in the contract
+    /// script.
+    ///
+    /// Source of truth: the VHTLC `claim` leaf in `ark-core` builds
+    /// `OP_HASH160 <preimage_hash> OP_EQUAL OP_VERIFY ...`
+    /// (`ark-core/src/vhtlc.rs`, `VhtlcOptions::claim_script`). `OP_HASH160`
+    /// is `RIPEMD160(SHA256(x))`, so this is what the script verifies — it is
+    /// not a Boltz-specific or Lightning-specific convention.
     pub fn preimage_hash(preimage: &[u8]) -> ripemd160::Hash {
         let sha = Sha256::digest(preimage);
         ripemd160::Hash::hash(sha.as_slice())
@@ -207,6 +215,34 @@ impl ArkadeBackend {
             .validate()
             .map_err(|e| arkade_config_error(format!("invalid VHTLC options: {e}")))?;
         Ok(options)
+    }
+
+    /// Reconstruct the [`VhtlcScript`] for a trade escrow from its public
+    /// parameters. The daemon uses this to derive the address it watches; it
+    /// does **not** fund or build the contract on behalf of the seller (§7).
+    pub fn vhtlc_script(
+        &self,
+        sender: XOnlyPublicKey,
+        receiver: XOnlyPublicKey,
+        preimage_hash: ripemd160::Hash,
+        network: Network,
+    ) -> Result<VhtlcScript, MostroError> {
+        let options = self.vhtlc_options(sender, receiver, preimage_hash)?;
+        VhtlcScript::new(options, network)
+            .map_err(|e| arkade_config_error(format!("invalid VHTLC script: {e}")))
+    }
+
+    /// The VHTLC [`ArkAddress`] the daemon watches for a trade escrow.
+    pub fn vhtlc_address(
+        &self,
+        sender: XOnlyPublicKey,
+        receiver: XOnlyPublicKey,
+        preimage_hash: ripemd160::Hash,
+        network: Network,
+    ) -> Result<ArkAddress, MostroError> {
+        Ok(self
+            .vhtlc_script(sender, receiver, preimage_hash, network)?
+            .address())
     }
 }
 
@@ -566,6 +602,29 @@ mod tests {
                 ArkadeBackend::preimage_hash(b"x")
             )
             .is_err());
+    }
+
+    #[test]
+    fn vhtlc_address_is_deterministic_and_p2tr() {
+        let mut config = test_config();
+        config.server_key = valid_secret_hex(3);
+        config.server_pubkey = String::new();
+
+        let backend = ArkadeBackend::new(config);
+        let preimage_hash = ArkadeBackend::preimage_hash(b"escrow");
+
+        let script = backend
+            .vhtlc_script(xonly_from(1), xonly_from(2), preimage_hash, Network::Signet)
+            .unwrap();
+        assert_eq!(script.script_pubkey().len(), 34);
+
+        let first = backend
+            .vhtlc_address(xonly_from(1), xonly_from(2), preimage_hash, Network::Signet)
+            .unwrap();
+        let second = backend
+            .vhtlc_address(xonly_from(1), xonly_from(2), preimage_hash, Network::Signet)
+            .unwrap();
+        assert_eq!(first.encode(), second.encode());
     }
 
     #[test]

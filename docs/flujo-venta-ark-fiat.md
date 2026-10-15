@@ -686,21 +686,25 @@ hay que portar nada desde el JS** (`@arkade-os/swap`):
   Mostro** con el `sqlx` existente (ver §15.4, persistencia).
 
 ```toml
-ark-rs = { version = "0.11.0", features = ["client", "grpc"] }
+ark-rs = { version = "0.11.0", default-features = false, features = ["client", "grpc", "tls-webpki-roots"] }
 ```
 
 ### 15.3 Checklist Fase 1
 
 Config y claves:
 
-- [ ] Añadir las deps Ark al `Cargo.toml` (hoy solo hay `hex` + `sha2`).
-- [ ] Derivar la clave `server` (`XOnlyPublicKey`) desde `server_key`, o
-      leer `server_pubkey`; validar contra `arkd` al arrancar.
-- [ ] Añadir a `[arkade]` los tres delays CSV
+- [x] Añadir las deps Ark al `Cargo.toml` (hoy solo hay `hex` + `sha2`).
+- [x] Derivar la clave `server` (`XOnlyPublicKey`) desde `server_key`, o
+      leer `server_pubkey` (`ArkadeBackend::server_xonly`).
+- [x] Añadir a `[arkade]` los tres delays CSV
       (`unilateral_claim_delay`, `unilateral_refund_delay`,
-      `unilateral_refund_without_receiver_delay`) — **no existen todavía**.
-- [ ] Definir `preimage_hash` = `ripemd160(sha256(preimage))`; la `preimage`
-      la genera y custodia el server.
+      `unilateral_refund_without_receiver_delay`).
+- [x] `preimage_hash` = **`HASH160(preimage)` = `ripemd160(sha256(preimage))`**
+      (`ArkadeBackend::preimage_hash`). No es una convención de Boltz ni de
+      Lightning: la hoja `claim` construye `OP_HASH160 <preimage_hash>
+      OP_EQUAL OP_VERIFY …`, y `OP_HASH160` **es** `RIPEMD160(SHA256(x))`.
+      Fuente: `ark-core/src/vhtlc.rs` (`VhtlcOptions::claim_script`). La
+      `preimage` la genera y custodia el server.
 
 Conexión al operador:
 
@@ -711,8 +715,17 @@ Conexión al operador:
 
 Backend real (reemplazar el stub en `src/arkade/backend.rs`):
 
-- [ ] `create_hold_invoice` → construir `VhtlcOptions` + `VhtlcScript`,
-      devolver `address()`/id.
+- [ ] `create_hold_invoice` → **el daemon NO construye ni funda el script**
+      (§7: eso es la wallet del vendedor). Debe: (a) generar `preimage` +
+      `preimage_hash`; (b) **publicar los parámetros del contrato** que la
+      wallet del vendedor necesita para construirlo (`server` x-only,
+      `refund_locktime`, los tres delays CSV); (c) poder **reconstruir el
+      `VhtlcScript`/address** (`ArkadeBackend::vhtlc_script`) a partir de
+      `sender`+`receiver`+`preimage_hash` para vigilarlo.
+      *Bloqueante de diseño:* la `receiver` (comprador) es una **dirección
+      Arkade**, no una clave Nostr; hoy `show_vhtlc_escrow_request` solo
+      recibe `buyer_pubkey`/`seller_pubkey` de Nostr. Hay que añadir el
+      intercambio de claves/direcciones Ark (mensaje o campo de orden).
 - [ ] **Observación de estado del VHTLC** (reemplazo de
       `invoice_subscribe`): transición real a `VhtlcStatus::Funded`/
       `Confirmed` cuando el vendedor funda (ver §14.1). Hoy esos estados
@@ -720,6 +733,8 @@ Backend real (reemplazar el stub en `src/arkade/backend.rs`):
       *Pendiente de verificar:* el equivalente Rust de `readLockupFate`
       (eventos de contrato de `ark-client` o el indexer). El watcher VHTLC
       de `ark-client` está orientado a **Boltz** → no aplica (ver §13).
+      Nota: `ark-client/src/boltz.rs` es un módulo *dentro del SDK Arkade*;
+      no implica dependencia del servicio Boltz.
 - [ ] `settle_hold_invoice` → co-firmar la hoja `claim` revelando la
       `preimage`; pagar al `receiver`.
 - [ ] `cancel_hold_invoice` → co-firmar la hoja `refund` /
@@ -735,10 +750,13 @@ Persistencia:
 
 Entorno y pruebas:
 
-- [ ] Levantar `arkd` regtest (el SDK trae `arkade-regtest` con Docker +
-      Node y `.env.regtest`; `just regtest-start`).
-- [ ] Unit: mapeo config → `VhtlcOptions` y máquina de estados del escrow.
-- [ ] e2e: fund → observar → `claim`/`refund` contra regtest.
+- [x] Unit: mapeo config → `VhtlcOptions`, derivación de `server`, `HASH160`.
+- [ ] **Operador de pruebas sin Docker:** usar el `arkd` **público de
+      mutinynet** (`https://mutinynet.arkade.sh`, `/v1/info` responde;
+      network `mutinynet`) en lugar del regtest con Docker
+      (`ghcr.io/arkade-os/arkd`) — las imágenes están geobloqueadas/son muy
+      lentas de bajar. El e2e Docker del SDK no es viable aquí.
+- [ ] e2e: fund → observar → `claim`/`refund` contra mutinynet.
 
 ### 15.4 Fases posteriores (solo referencia)
 
