@@ -727,10 +727,11 @@ Backend real (reemplazar el stub en `src/arkade/backend.rs`):
       `refund_locktime`, los tres delays CSV); (c) poder **reconstruir el
       `VhtlcScript`/address** (`ArkadeBackend::vhtlc_script`) a partir de
       `sender`+`receiver`+`preimage_hash` para vigilarlo.
-      *Bloqueante de diseño:* la `receiver` (comprador) es una **dirección
-      Arkade**, no una clave Nostr; hoy `show_vhtlc_escrow_request` solo
-      recibe `buyer_pubkey`/`seller_pubkey` de Nostr. Hay que añadir el
-      intercambio de claves/direcciones Ark (mensaje o campo de orden).
+      *Bloqueante de diseño (resuelto en §16):* la `receiver` (comprador) es
+      una clave pública Ark x-only, no una clave Nostr; hoy
+      `show_vhtlc_escrow_request` solo recibe `buyer_pubkey`/`seller_pubkey`
+      de Nostr. §16 define el intercambio de claves Ark y las acciones
+      `mostro-core` necesarias.
 - [ ] **Observación de estado del VHTLC** (reemplazo de
       `invoice_subscribe`): transición real a `VhtlcStatus::Funded`/
       `Confirmed` cuando el vendedor funda (ver §14.1). Hoy esos estados
@@ -776,3 +777,145 @@ Entorno y pruebas:
   waiting-state actual (§14.2).
 - **Fase 5 — Infra:** persistencia completa, gRPC admin en modo arkade
   (hoy no arranca), wizard de config y bonds (§12).
+
+## 16. Intercambio de claves/direcciones Ark (diseño de protocolo)
+
+Esta sección define **cómo llegan al daemon las claves públicas Ark de los dos
+peers** para poder (a) entregar al vendedor los parámetros con que construye el
+VHTLC y (b) recomputar el address del VHTLC que debe vigilar. Es la respuesta
+al bloqueante registrado en §15.3.
+
+### 16.1 Qué necesita cada actor
+
+| Actor | Aporta | Necesita |
+| --- | --- | --- |
+| Vendedor (`sender`) | su clave Ark `P_S` (x-only) | `preimage_hash`, `server`, `refund_locktime`, delays, `receiver = P_B` |
+| Comprador (`receiver`) | su clave Ark `P_B` (x-only) | nada para fondear; `P_B` **es** su destino de cobro |
+| Daemon (`server`) | `R` (preimage), `preimage_hash`, `server`, delays/locktime | `P_S` y `P_B` para recomputar el address |
+
+`server` sale de `arkd` (`server_info.signer_pk`, §15.3) y los delays/locktime
+de `[arkade]`; **no** viajan por el protocolo. Lo único que debe viajar son las
+**claves Ark de los dos peers** (y la confirmación del fundado).
+
+### 16.2 Son claves de *identidad*, no direcciones de pago
+
+No se intercambian `ArkAddress`: `VhtlcOptions` pide `XOnlyPublicKey` para
+`sender` y `receiver`, y una `ArkAddress` incluye además la clave del `server`,
+así que embeber la dirección ata el contrato a un operador concreto sin
+aportar nada. Se intercambian **claves públicas x-only**, una por peer y por
+trade.
+
+> La wallet deriva una clave Ark por trade (hermana del `trade_index` de
+> Nostr) y **solo publica la pública**; el daemon nunca ve la privada.
+
+### 16.3 El "VHTLC descriptor" (resuelve el chicken-and-egg)
+
+En Lightning el daemon **genera** la hold invoice y la entrega
+(`Action::PayInvoice`); el vendedor solo la paga. En Ark **el vendedor
+construye el contrato**, así que antes de fondear necesita `preimage_hash`,
+`P_B` y los parámetros. Por eso el equivalente de `PayInvoice` no es un
+"paga esto" sino un **descriptor** que el daemon entrega al vendedor:
+
+```text
+VhtlcDescriptor {
+    order_id,
+    amount,                       // amount + fee del vendedor
+    preimage_hash,                // HASH160(R)
+    server_pubkey,                // x-only de arkd (signer_pk)
+    refund_locktime,              // bloques
+    unilateral_claim_delay,
+    unilateral_refund_delay,
+    unilateral_refund_without_receiver_delay,
+    sender_pubkey,                // P_S (eco, para binding)
+    receiver_pubkey,              // P_B (destino de cobro)
+}
+```
+
+El vendedor: (1) valida `sender_pubkey == su P_S`; (2) construye
+`VhtlcScript::new(VhtlcOptions{…}, network)`; (3) funda el vtxo; (4) responde
+con el **outpoint** (o el address) del VHTLC fundado.
+
+### 16.4 Mapeo Lightning → Ark
+
+| Paso | Lightning (hoy) | Ark (propuesto) |
+| --- | --- | --- |
+| Destino de cobro del comprador | `AddInvoice` con bolt11 | `AddVhtlcReceiver` con `P_B` |
+| El daemon entrega el pago a fondear | `PayInvoice` con bolt11 | `PayVhtlcInvoice` con `VhtlcDescriptor` |
+| El vendedor fondea | paga la hold invoice | `AddVhtlcEscrow` con el outpoint fundado |
+| El daemon confirma la llegada | `invoice_subscribe` (evento LND) | observa el address VHTLC (evento vtxo) |
+| `cancel`/`refund` | `cancel_hold_invoice` | refund a `P_S` |
+| `release`/`settle` | `settle_hold_invoice` | claim de `P_B` (el server co-firma con `R`) |
+
+Los **estados** de orden se reutilizan tal cual: `WaitingBuyerInvoice` (falta
+`P_B`) y `WaitingPayment` (falta el fundado). No se añaden estados.
+
+### 16.5 Cambios propuestos en `mostro-core` (contrato compartido)
+
+Propuesta **single-kind** (dominio `order`), con scope declaration:
+
+- `struct VhtlcDescriptor { … }` (§16.3).
+- `struct VhtlcEscrow { order_id, address, txid, vout }` (outpoint fundado).
+- `struct VhtlcReceiver { order_id, receiver_pubkey }`.
+- `Action::AddVhtlcReceiver` (Comprador → Mostro), `Payload::VhtlcReceiver`.
+- `Action::PayVhtlcInvoice` (Mostro → Vendedor), `Payload::VhtlcDescriptor`.
+- `Action::AddVhtlcEscrow` (Vendedor → Mostro), `Payload::VhtlcEscrow`.
+- `MessageKind::verify`: nuevas ramas con el mismo patrón que
+  `Action::AddCashuEscrow` / `Action::CashuPmSignature` (exigen `id` y payload
+  tipado).
+
+`Action::PayInvoice` **no** se reutiliza: la forma del payload difiere
+(descriptor vs bolt11) y el cliente debe discriminar por acción, no por
+sniffing.
+
+### 16.6 Secuencia (orden de venta)
+
+```text
+VENDEDOR                 DAEMON (R, server)              COMPRADOR
+   |                          |                              |
+   |                          |<------ take (sell) ----------|
+   |                          |                              |
+   |                          |<--- AddVhtlcReceiver(P_B) ---|
+   |                          |                              |
+   |<-- PayVhtlcInvoice ------|                              |
+   |    (VhtlcDescriptor)     |--- WaitingSellerToPay ------>|
+   |                          |                              |
+   | construye + funda VHTLC  |                              |
+   |-- AddVhtlcEscrow ------->|                              |
+   |    (outpoint)            |                              |
+   |                          | observa address → Funded     |
+   |        ...pago fiat...   |                              |
+   |-- release -------------->|                              |
+   |                          |-- claim (co-firma server) -->| cobra
+```
+
+### 16.7 Compatibilidad y alcance
+
+- **Dominio:** 3 acciones + 3 payloads, todas del dominio `order`; no toca
+  `dispute`. Requiere scope declaration en el PR de `mostro-core`.
+- **Versionado:** subir `PROTOCOL_VER` en `mostro-core`, publicar el crate y
+  subir la dep en el daemon y en `mostro_app`.
+- **Compatibilidad:** son **variantes aditivas**. En modo Lightning nunca se
+  emiten; el modo arkade es opt-in y hoy devuelve `CantDo`, así que un cliente
+  viejo no recibe acciones nuevas hasta que el operador active arkade.
+- **Orden de implementación:** (1) `mostro-core` (tipos + `verify` + tests);
+  (2) daemon: emitir `PayVhtlcInvoice` con el descriptor real (hoy manda el
+  `vhtlc_id` opaco); (3) daemon: `AddVhtlcReceiver` + `AddVhtlcEscrow`;
+  (4) observación del vtxo → `Funded`.
+
+### 16.8 Alternativas descartadas
+
+- **Reutilizar `Payload::PaymentRequest`** metiendo el descriptor serializado
+  en el slot del bolt11: rompe la semántica del tipo, impide validar en
+  `verify()` y obliga a distinguir por longitud/formato.
+- **Intercambiar `ArkAddress`** en vez de claves x-only: ver §16.2.
+- **Nuevo estado de orden** para "esperando `P_B`": innecesario, se reutiliza
+  `WaitingBuyerInvoice`.
+
+### 16.9 Relación con §15.3
+
+Cierra el bloqueante "la `receiver` (comprador) es una dirección Arkade, no
+una clave Nostr". `show_vhtlc_escrow_request` dejará de enviar
+`Payload::PaymentRequest(Some(new_order), vhtlc_id, None)` y enviará
+`Action::PayVhtlcInvoice` con el `VhtlcDescriptor`; el `vhtlc_id` opaco
+desaparece y se sustituye por `preimage_hash` + claves, de los que el address
+se recomputa con `ArkadeBackend::vhtlc_address`.
